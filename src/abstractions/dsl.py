@@ -1,3 +1,14 @@
+"""
+dsl.py
+
+This module defines a domain-specific language (DSL) for compositional geometric abstraction.
+It includes shape classes such as Rect, Move, Union, SymTrans, and SymRef, each supporting
+recursive composition and evaluation to generate a list of geometric boxes.
+
+Additionally, it supports instantiation from abstract parameter lists and includes an Abstraction
+class that can expand itself using a neural model decoder.
+"""
+
 from __future__ import annotations
 
 import torch
@@ -6,9 +17,30 @@ from torch import nn
 from abstractions.primitives import Box
 
 def left_pad(string, pad, n):
+    """
+    Indents each line of a multiline string by a given number of padding characters.
+
+    Args:
+        string (str): The string to be indented.
+        pad (str): Padding character(s).
+        n (int): Number of times to apply the padding.
+
+    Returns:
+        str: Indented multiline string.
+    """
     return "\n".join([n * pad + s for s in string.split("\n")])
 
 def instantiate(type_list: list[type], param_list: list):
+    """
+    Instantiates a shape expression from a list of types and corresponding parameters.
+
+    Args:
+        type_list (list[type]): A list describing the expected structure of the shape.
+        param_list (list): A list of parameters used to instantiate the shape.
+
+    Returns:
+        Shape: The instantiated shape object.
+    """
     def _instantiate(type_list: list[type], param_list: list):
         token = type_list.pop(0)
 
@@ -50,6 +82,12 @@ def instantiate(type_list: list[type], param_list: list):
 
 
 class Shape:
+    """
+    Base class for all shapes in the DSL.
+
+    Attributes:
+        children (list[Shape]): Child shapes used in composition.
+    """
     def __init__(self, children: list[Shape]):
         self.children = children
 
@@ -64,6 +102,16 @@ class Shape:
 
 
 class Rect(Shape):
+    """
+    A rectangle shape defined by width and height.
+
+    Args:
+        s_x (float): Width of the rectangle.
+        s_y (float): Height of the rectangle.
+
+    Returns:
+        A box centered at origin with the specified scale.
+    """
     def __init__(self, s_x: float, s_y: float):
         super().__init__(children=[])
         self.s_x = s_x
@@ -80,6 +128,17 @@ class Rect(Shape):
 
 
 class Move(Shape):
+    """
+    A shape representing a translation of a child shape.
+
+    Args:
+        child (Shape): The shape to be moved.
+        t_x (float): Translation along the x-axis.
+        t_y (float): Translation along the y-axis.
+
+    Returns:
+        The translated shape's boxes shifted accordingly.
+    """
     def __init__(self, child: Shape, t_x: float, t_y: float):
         super().__init__(children=[child])
         self.t_x = t_x
@@ -102,6 +161,16 @@ class Move(Shape):
 
 
 class Union(Shape):
+    """
+    A shape representing the union of two child shapes.
+
+    Args:
+        child1 (Shape): The first child shape.
+        child2 (Shape): The second child shape.
+
+    Returns:
+        Combined list of boxes from both child shapes.
+    """
     def __init__(self, child1: Shape, child2: Shape):
         super().__init__(children=[child1, child2])
 
@@ -118,6 +187,18 @@ class Union(Shape):
 
 
 class SymTrans(Shape):
+    """
+    A shape representing symmetric translation of a child shape along an axis.
+
+    Args:
+        child (Shape): The shape to be symmetrically translated.
+        axis (str): Axis along which to translate ('x' or 'y').
+        dist (float): Total distance of translation.
+        degree (int): Number of translated copies including the original.
+
+    Returns:
+        List of boxes including the original and translated copies.
+    """
     def __init__(self, child: Shape, axis: str, dist: float, degree: int):
         super().__init__(children=[child])
         self.axis = axis
@@ -143,6 +224,16 @@ class SymTrans(Shape):
 
 
 class SymRef(Shape):
+    """
+    A shape representing symmetric reflection of a child shape about an axis.
+
+    Args:
+        child (Shape): The shape to be reflected.
+        axis (str): Axis about which to reflect ('x' or 'y').
+
+    Returns:
+        List of boxes including the original and reflected copies.
+    """
     def __init__(self, child: Shape, axis: str):
         super().__init__(children=[child])
         self.axis = axis
@@ -165,6 +256,18 @@ class SymRef(Shape):
 
 
 class Abstraction(Shape):
+    """
+    A shape abstraction that can expand itself using a neural model decoder.
+
+    Args:
+        type_list (list[type]): List of types describing the shape structure.
+        float_parameters (list[float]): List of float parameters used for expansion.
+        other_parameters (list): List of other parameters including shapes and strings.
+        model (nn.Module): Neural model with a decoder to expand float parameters.
+
+    Returns:
+        Expanded concrete shape after decoding.
+    """
     def __init__(self, type_list: list[type], float_parameters: list[float], other_parameters: list, model: nn.Module):
         super().__init__(children=[child for child in other_parameters if isinstance(child, Shape)])
         self.type_list = type_list
@@ -189,6 +292,12 @@ class Abstraction(Shape):
         return output
 
     def expand(self) -> Shape:
+        """
+        Expands the abstract parameters into a concrete shape using the decoder from the neural model.
+
+        Returns:
+            Shape: The expanded, instantiated shape.
+        """
         self.model.eval()
         decoder = self.model.decoder
         decoder_input = torch.tensor(self.float_parameters, dtype=torch.float32)[None, :]
@@ -214,5 +323,4 @@ class Abstraction(Shape):
 
     def param_tuple(self):
         return Abstraction, (self.type_list, self.float_parameters, self.other_parameters, self.model)
-
 
