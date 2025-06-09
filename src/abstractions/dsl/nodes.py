@@ -18,8 +18,8 @@ Dependencies:
 - Uses `left_pad` for formatted string output.
 """
 
-from abstractions.dsl import Shape, left_pad
-from abstractions.primitives import Box
+from abstractions.dsl.core import Shape, left_pad
+from abstractions.primitives.shapes import Box
 
 import torch
 

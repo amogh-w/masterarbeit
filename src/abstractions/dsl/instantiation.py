@@ -16,7 +16,8 @@ Example:
     shape = instantiate(type_list, param_list)  # → Move(Rect(10, 20), 1, 2)
 """
 
-from abstractions.dsl import Shape, Rect, Move, Union, SymTrans, SymRef
+from abstractions.dsl.core import Shape
+from abstractions.dsl.nodes import Rect, Move, Union, SymTrans, SymRef
 
 
 def instantiate(type_list: list[type], param_list: list):

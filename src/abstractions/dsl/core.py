@@ -20,7 +20,7 @@ Dependencies:
 
 from __future__ import annotations
 
-from abstractions.primitives import Box
+from abstractions.primitives.shapes import Box
 
 
 class Shape:

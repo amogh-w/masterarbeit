@@ -19,8 +19,9 @@ Typical use case:
 import torch
 from torch import nn
 
-from abstractions.dsl import Shape, left_pad, instantiate
-from abstractions.primitives import Box
+from abstractions.dsl.core import Shape, left_pad
+from abstractions.dsl.instantiation import instantiate
+from abstractions.primitives.shapes import Box
 
 
 class Abstraction(Shape):

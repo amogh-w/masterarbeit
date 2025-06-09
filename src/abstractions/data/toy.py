@@ -8,7 +8,8 @@ as well as random generators for testing abstraction discovery algorithms.
 
 import random
 
-from abstractions.dsl import Union, SymRef, Move, Rect, SymTrans, Shape
+from abstractions.dsl.core import Shape
+from abstractions.dsl.nodes import Union, SymRef, Move, Rect, SymTrans
 
 
 def random_quantized_uniform(low: float, high: float, steps: int) -> float:
