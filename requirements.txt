@@ -2,3 +2,4 @@ matplotlib
 torch
 jupyterlab
 pdoc3
+k3d
