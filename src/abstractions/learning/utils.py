@@ -1,3 +1,14 @@
+"""
+utils.py
+
+Utility functions to prepare training data and analyze reconstruction
+performance for neural models in the abstraction discovery pipeline.
+
+Functions include data loaders for MLPs and autoencoders, evaluation of
+well-explained instances, and helpers for managing symbolic structure
+datasets.
+"""
+
 from collections import defaultdict
 import torch
 from torch import Tensor
@@ -11,38 +22,49 @@ def prepare_mlp_train_data(parameters, output_index):
     """
     Prepares training data for an MLP by excluding one parameter as the target output.
 
-    Args:
-        parameters (list): A list of parameter tuples.
-        output_index (int): The index of the parameter to predict.
+    Parameters
+    ----------
+    parameters : list[tuple]
+        A list of parameter tuples (N samples × D parameters).
+    output_index : int
+        The index of the parameter to predict.
 
-    Returns:
-        DataLoader: A DataLoader for the training dataset.
+    Returns
+    -------
+    DataLoader
+        A PyTorch DataLoader containing input-output training pairs.
     """
-    tensor = torch.tensor(parameters).swapaxes(0, 1)
-    input_data = tensor[
-        :, tuple([i for i in range(tensor.shape[1]) if i != output_index])
-    ]
-    output_data = tensor[:, (output_index,)]
-    train_data = TensorDataset(input_data, output_data)
-    train_dl = DataLoader(train_data, batch_size=64, shuffle=True)
-    return train_dl
+    tensor = torch.tensor(parameters, dtype=torch.float32)  # shape: [N, D]
+
+    # Separate input and output columns
+    input_mask = [i for i in range(tensor.shape[1]) if i != output_index]
+    input_data = tensor[:, input_mask]  # shape: [N, D-1]
+    output_data = tensor[:, output_index].unsqueeze(1)  # shape: [N, 1]
+
+    train_dataset = TensorDataset(input_data, output_data)
+    return DataLoader(train_dataset, batch_size=64, shuffle=True)
 
 
 def prepare_autoencoder_train_data(parameters, mask):
     """
     Prepares training data for an autoencoder based on a boolean mask.
 
-    Args:
-        parameters (list): A list of parameter tuples.
-        mask (Tensor): A boolean mask indicating which data points to include.
+    Parameters
+    ----------
+    parameters : list[tuple]
+        A list of parameter tuples (N samples × D parameters).
+    mask : Tensor
+        A 1D boolean mask (length N) indicating which parameter rows to include.
 
-    Returns:
-        DataLoader: A DataLoader for the masked training dataset.
+    Returns
+    -------
+    DataLoader
+        A PyTorch DataLoader for the masked training dataset.
     """
-    tensor = torch.tensor(parameters).swapaxes(0, 1)
-    train_data = TensorDataset(tensor[mask, :])
-    train_dl = DataLoader(train_data, batch_size=64, shuffle=True)
-    return train_dl
+    tensor = torch.tensor(parameters, dtype=torch.float32).T  # transpose to [N, D]
+    masked_data = tensor[mask]  # apply boolean mask to rows
+    dataset = TensorDataset(masked_data)
+    return DataLoader(dataset, batch_size=64, shuffle=True)
 
 
 def is_well_explained(
@@ -51,13 +73,19 @@ def is_well_explained(
     """
     Determines which parameter vectors are well explained by an autoencoder model.
 
-    Args:
-        parameters (Tensor): A batch of parameter vectors.
-        model (Autoencoder): The trained autoencoder model.
-        threshold (float): The maximum reconstruction error allowed for a point to be considered well explained.
+    Parameters
+    ----------
+    parameters : Tensor
+        A batch of parameter vectors of shape (N, D).
+    model : Autoencoder
+        The trained autoencoder model.
+    threshold : float
+        Maximum allowed reconstruction error for a point to be considered well explained.
 
-    Returns:
-        Tensor: A boolean tensor indicating which parameter vectors are well explained.
+    Returns
+    -------
+    Tensor
+        A 1D boolean tensor of shape (N,) indicating which vectors are well explained.
     """
     # parameters.shape = (batch_size, num_parameters)
     model.eval()
@@ -72,14 +100,19 @@ def is_well_explained(
 
 def add(structures1, structures2):
     """
-    Adds values from structures2 into structures1 by appending lists for matching keys.
+    Merges two defaultdict(list) structures by appending values for matching keys.
 
-    Args:
-        structures1 (defaultdict): The primary dictionary to which values will be added.
-        structures2 (defaultdict): The secondary dictionary whose values will be appended.
+    Parameters
+    ----------
+    structures1 : defaultdict
+        The primary dictionary to which values will be added.
+    structures2 : defaultdict
+        The secondary dictionary whose values will be appended to structures1.
 
-    Returns:
-        defaultdict: The updated structures1 dictionary.
+    Returns
+    -------
+    defaultdict
+        The updated structures1 dictionary with merged values.
     """
 
     for key in structures2.keys():
@@ -88,81 +121,75 @@ def add(structures1, structures2):
     return structures1
 
 
-# In[9]:
-
-
 def get_singletons(shapes: Shape | list[Shape]):
     """
     Recursively extracts all singleton shape structures (non-composite shapes) from a shape or list of shapes.
 
-    Args:
-        shapes (Shape | list[Shape]): A single Shape or a list of Shapes.
+    Parameters
+    ----------
+    shapes : Shape or list of Shape
+        A single Shape instance or a list of Shape instances.
 
-    Returns:
-        defaultdict: A dictionary mapping shape type names to lists of their parameter tuples.
+    Returns
+    -------
+    defaultdict
+        A dictionary mapping shape type names to lists of their parameter tuples.
     """
-    if isinstance(shapes, list):
-        singletons = defaultdict(list)
+    singletons = defaultdict(list)
 
+    if isinstance(shapes, list):
         for shape in shapes:
             singletons = add(singletons, get_singletons(shape))
-
         return singletons
 
-    type, parameters = shapes.param_tuple()
-    type_str = type.__name__
-    current_structures = defaultdict(list)
-    current_structures[type_str].append(parameters)
+    shape_type, parameters = shapes.param_tuple()
+    singletons[shape_type.__name__].append(parameters)
 
-    if (
-        isinstance(shapes, Move)
-        or isinstance(shapes, SymTrans)
-        or isinstance(shapes, SymRef)
-    ):
-        current_structures = add(get_singletons(shapes.children[0]), current_structures)
-    elif isinstance(shapes, Union):
-        current_structures = add(get_singletons(shapes.children[0]), current_structures)
-        current_structures = add(get_singletons(shapes.children[1]), current_structures)
+    match shapes:
+        case Move() | SymTrans() | SymRef():
+            singletons = add(singletons, get_singletons(shapes.children[0]))
+        case Union():
+            for child in shapes.children:
+                singletons = add(singletons, get_singletons(child))
+        case _:
+            pass
 
-    return current_structures
-
-
-# In[10]:
+    return singletons
 
 
 def get_pairs(shapes: Shape | list[Shape]):
     """
     Recursively extracts all binary composite structures (e.g., Union of two shapes) from a shape or list of shapes.
 
-    Args:
-        shapes (Shape | list[Shape]): A single Shape or a list of Shapes.
+    Parameters
+    ----------
+    shapes : Shape or list of Shape
+        A single Shape instance or a list of Shape instances.
 
-    Returns:
-        defaultdict: A dictionary mapping composite type descriptions to lists of parameter tuples.
+    Returns
+    -------
+    defaultdict
+        A dictionary mapping composite structure type descriptions to lists of combined child parameter tuples.
     """
-    if isinstance(shapes, list):
-        pairs = defaultdict(list)
+    pairs = defaultdict(list)
 
+    if isinstance(shapes, list):
         for shape in shapes:
             pairs = add(pairs, get_pairs(shape))
-
         return pairs
 
-    if (
-        isinstance(shapes, Move)
-        or isinstance(shapes, SymTrans)
-        or isinstance(shapes, SymRef)
-    ):
-        return get_pairs(shapes.children[0])
-    elif isinstance(shapes, Union):
-        type, (child1, child2) = shapes.param_tuple()
-        type1, parameters1 = child1.param_tuple()
-        type2, parameters2 = child2.param_tuple()
-        type_str = f"{type.__name__}({type1.__name__}, {type2.__name__})"
-        current_structures = defaultdict(list)
-        current_structures[type_str].append(parameters1 + parameters2)
-        current_structures = add(get_pairs(shapes.children[0]), current_structures)
-        current_structures = add(get_pairs(shapes.children[1]), current_structures)
-        return current_structures
-    else:
-        return defaultdict(list)
+    match shapes:
+        case Move() | SymTrans() | SymRef():
+            return get_pairs(shapes.children[0])
+        case Union():
+            type_, (child1, child2) = shapes.param_tuple()
+            type1, params1 = child1.param_tuple()
+            type2, params2 = child2.param_tuple()
+            type_str = f"{type_.__name__}({type1.__name__}, {type2.__name__})"
+            current_structures = defaultdict(list)
+            current_structures[type_str].append(params1 + params2)
+            current_structures = add(get_pairs(shapes.children[0]), current_structures)
+            current_structures = add(get_pairs(shapes.children[1]), current_structures)
+            return current_structures
+        case _:
+            return defaultdict(list)
