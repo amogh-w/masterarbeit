@@ -108,6 +108,8 @@ class Union(Shape):
     """
 
     def __init__(self, child1: Shape, child2: Shape):
+        if not isinstance(child1, Shape) or not isinstance(child2, Shape):
+            raise TypeError("Union expects two Shape instances.")
         super().__init__(children=[child1, child2])
 
     def __str__(self):

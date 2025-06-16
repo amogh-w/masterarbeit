@@ -3,3 +3,6 @@ torch
 jupyterlab
 pdoc3
 k3d
+graphviz
+pandas
+plotly
