@@ -20,8 +20,8 @@ Dependencies:
 
 from abstractions.dsl.core import Shape, left_pad
 from abstractions.primitives.shapes import Box
-
 import torch
+import textwrap
 
 
 class Rect(Shape):
@@ -42,7 +42,9 @@ class Rect(Shape):
         self.s_y = s_y
 
     def __str__(self):
-        return f"Rect(\n    {self.s_x:.3f},\n    {self.s_y:.3f}\n)"
+        params = f"{self.s_x:.3f},\n{self.s_y:.3f}"
+        indented = textwrap.indent(params, "    ")
+        return f"Rect(\n{indented}\n)"
 
     def get_box_list(self) -> list[Box]:
         return [
@@ -75,7 +77,10 @@ class Move(Shape):
         self.t_y = t_y
 
     def __str__(self):
-        return f"Move(\n    {left_pad(str(self.children[0]), '    ', 1)},\n    {self.t_x:.3f},\n    {self.t_y:.3f}\n)"
+        child_str = textwrap.indent(str(self.children[0]), "    ")
+        params = f"{self.t_x:.3f},\n{self.t_y:.3f}"
+        indented_params = textwrap.indent(params, "    ")
+        return f"Move(\n{child_str},\n{indented_params}\n)"
 
     def get_box_list(self) -> list[Box]:
         child_boxes = self.children[0].get_box_list()
@@ -106,7 +111,9 @@ class Union(Shape):
         super().__init__(children=[child1, child2])
 
     def __str__(self):
-        return f"Union(\n    {left_pad(str(self.children[0]), '    ', 1)},\n    {left_pad(str(self.children[1]), '    ', 1)}\n)"
+        child1_str = textwrap.indent(str(self.children[0]), "    ")
+        child2_str = textwrap.indent(str(self.children[1]), "    ")
+        return f"Union(\n{child1_str},\n{child2_str}\n)"
 
     def get_box_list(self) -> list[Box]:
         child_boxes1 = self.children[0].get_box_list()
@@ -138,7 +145,10 @@ class SymTrans(Shape):
         self.degree = degree
 
     def __str__(self):
-        return f"SymTrans(\n    {left_pad(str(self.children[0]), '    ', 1)},\n    {self.axis},\n    {self.dist:.3f},\n    {self.degree}\n)"
+        child_str = textwrap.indent(str(self.children[0]), "    ")
+        params = f"{self.axis},\n{self.dist:.3f},\n{self.degree}"
+        indented_params = textwrap.indent(params, "    ")
+        return f"SymTrans(\n{child_str},\n{indented_params}\n)"
 
     def get_box_list(self) -> list[Box]:
         child_boxes = self.children[0].get_box_list()
@@ -174,7 +184,8 @@ class SymRef(Shape):
         self.axis = axis
 
     def __str__(self):
-        return f"SymRef(\n    {left_pad(str(self.children[0]), '    ', 1)},\n    {self.axis}\n)"
+        child_str = textwrap.indent(str(self.children[0]), "    ")
+        return f"SymRef(\n{child_str},\n    {self.axis}\n)"
 
     def get_box_list(self) -> list[Box]:
         child_boxes = self.children[0].get_box_list()
