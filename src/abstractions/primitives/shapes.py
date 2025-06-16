@@ -20,9 +20,16 @@ class Box:
         """
         Initializes a Box with a given center and scale.
 
-        Args:
-            center (Tensor): The center coordinates of the box.
-            scale (Tensor): The size of the box along the x and y axes.
+        Parameters
+        ----------
+        center : Tensor
+            The center coordinates of the box (x, y).
+        scale : Tensor
+            The width and height of the box.
+
+        Returns
+        -------
+        None
         """
         self.center = center
         self.scale = scale
@@ -41,9 +48,16 @@ class Circle:
         """
         Initializes a Circle with a given center and radius.
 
-        Args:
-            center (Tensor): The center coordinates of the circle.
-            radius (Tensor): The radius of the circle.
+        Parameters
+        ----------
+        center : Tensor
+            The center coordinates of the circle (x, y).
+        radius : Tensor
+            A scalar tensor representing the radius of the circle.
+
+        Returns
+        -------
+        None
         """
         self.center = center
         self.radius = radius
