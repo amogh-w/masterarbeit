@@ -6,3 +6,4 @@ k3d
 graphviz
 pandas
 plotly
+scikit-learn
