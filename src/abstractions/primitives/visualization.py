@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import k3d
 import plotly.graph_objects as go
 import numpy as np
+from abstractions.dsl.core import Shape
 from abstractions.primitives.shapes import Box, Circle
 
 
@@ -283,3 +284,129 @@ def show_circles_plotly(circles: list[Circle], limits=(-1, 1)):
         showlegend=False,
     )
     fig.show()
+
+
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from graphviz import Digraph
+
+
+def _add_graphviz_nodes(dot, shape, parent_id=None, node_id=0):
+    if isinstance(shape, Shape):
+        label = shape.__class__.__name__
+        dot.node(
+            str(node_id),
+            label,
+            shape="box",
+            style="filled",
+            fillcolor="#e0f7fa",
+            fontname="Helvetica",
+        )
+        if parent_id is not None:
+            dot.edge(str(parent_id), str(node_id))
+        _, args = shape.param_tuple()
+        next_id = node_id + 1
+        for arg in args:
+            next_id = _add_graphviz_nodes(dot, arg, node_id, next_id)
+        return next_id
+    else:
+        dot.node(
+            str(node_id),
+            repr(shape),
+            shape="ellipse",
+            style="filled",
+            fillcolor="#fff9c4",
+            fontname="Helvetica",
+        )
+        if parent_id is not None:
+            dot.edge(str(parent_id), str(node_id))
+        return node_id + 1
+
+
+def print_tree(shape):
+    """
+    Renders a shape DSL tree as a styled Graphviz Digraph for display in Jupyter.
+
+    Args:
+        shape (Shape): Root of the DSL tree.
+
+    Returns:
+        graphviz.Digraph: A styled graph object that can be rendered inline.
+    """
+    dot = Digraph(format="svg")
+    # dot.attr(
+    #     rankdir="TB",
+    #     fontname="Helvetica",
+    #     fontsize="10",
+    #     dpi="150",
+    #     nodesep="0.4",
+    #     ranksep="0.6",
+    #     concentrate="true",
+    # )
+    # dot.attr(size="")  # allow Graphviz to autosize
+    _add_graphviz_nodes(dot, shape)
+    return dot
+
+
+def visualize_combined_dataset(dataset, categories):
+    """
+    Creates an interactive widget to browse and visualize a combined dataset.
+
+    Parameters
+    ----------
+    dataset : list
+        Combined list of shape objects.
+    categories : list of tuples
+        List of (category_name, start_idx, end_idx) defining dataset segments.
+
+    Returns
+    -------
+    None
+        Displays interactive widgets in the notebook.
+    """
+    category_dropdown = widgets.Dropdown(
+        options=[c[0] for c in categories], description="Category:"
+    )
+
+    index_slider = widgets.IntSlider(
+        min=0, max=categories[0][2] - categories[0][1], description="Index:"
+    )
+
+    output = widgets.Output()
+
+    def global_index(category_name, relative_idx):
+        for name, start, end in categories:
+            if name == category_name:
+                return start + relative_idx
+        return None
+
+    def update_slider_range(change):
+        selected = change["new"]
+        for name, start, end in categories:
+            if name == selected:
+                index_slider.min = 0
+                index_slider.max = end - start
+                index_slider.value = 0
+                break
+
+    def update_visualization(change=None):
+        output.clear_output()
+        with output:
+            cat = category_dropdown.value
+            idx = index_slider.value
+            g_idx = global_index(cat, idx)
+            if g_idx is None or g_idx >= len(dataset):
+                print("Invalid index!")
+                return
+            shape = dataset[g_idx]
+            display(print_tree(shape))
+            show_boxes(shape.get_box_list(), backend="plotly")
+
+    category_dropdown.observe(update_slider_range, names="value")
+    category_dropdown.observe(update_visualization, names="value")
+    index_slider.observe(update_visualization, names="value")
+
+    display(widgets.VBox([category_dropdown, index_slider]), output)
+
+    # Initialize display
+    update_visualization()
