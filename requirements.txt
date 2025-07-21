@@ -7,3 +7,6 @@ graphviz
 pandas
 plotly
 scikit-learn
+seaborn
+scikit-dimension
+hdbscan

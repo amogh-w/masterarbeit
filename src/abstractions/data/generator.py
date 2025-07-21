@@ -10,8 +10,11 @@ from .chair_2 import random_chairs_2
 from .chair_3 import random_chairs_3
 from .lamp_1 import random_lamps_1
 from .table_1 import random_tables_1
+from .shelf_1 import random_shelves_1
 from .square import random_squares
 from .random_tree import random_shapes
+from .window_1 import random_windows_1
+from .window_2 import random_windows_2
 
 
 def generate_dataset(kind: str, num_shapes: int):
@@ -36,11 +39,17 @@ def generate_dataset(kind: str, num_shapes: int):
             return random_chairs_3(num_shapes)
         case "lamp_1":
             return random_lamps_1(num_shapes)
+        case "shelf_1":
+            return random_shelves_1(num_shapes)
         case "table_1":
             return random_tables_1(num_shapes)
         case "square":
             return random_squares(num_shapes)
         case "random":
             return random_shapes(num_shapes)
+        case "window_1":
+            return random_windows_1(num_shapes)
+        case "window_2":
+            return random_windows_2(num_shapes)
         case _:
             raise ValueError(f"Unknown shape kind: {kind}")
