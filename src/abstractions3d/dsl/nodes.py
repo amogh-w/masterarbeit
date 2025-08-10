@@ -1,18 +1,5 @@
 """
-Node definitions for the 3D shape DSL (Domain-Specific Language).
-
-This module defines symbolic 3D shape classes such as Cube, Move3D, Union3D, SymTrans3D, and SymRef3D,
-allowing hierarchical composition and transformation of shapes in a structured 3D way.
-
-Each shape subclass of `Shape3D` implements:
-- `__str__`: for readable, indented serialization
-- `get_box3d_list()`: for converting symbolic shapes to concrete `Box3D` representations
-- `param_tuple()`: for reconstruction or serialization of the shape tree
-
-Dependencies:
-- Uses PyTorch tensors for geometric computation.
-- Depends on the `Box3D` class for geometric output.
-- Uses `left_pad` for formatted string output.
+3D shape DSL nodes: Rect3D, Move3D, Union3D, SymTrans3D, SymRef3D.
 """
 
 from abstractions3d.dsl.core import Shape3D, left_pad
@@ -21,8 +8,8 @@ import torch
 import textwrap
 
 
-class Cube(Shape3D):
-    """A cube shape defined by width, height, and depth."""
+class Rect3D(Shape3D):
+    """Rectangular box shape."""
 
     def __init__(self, s_x: float, s_y: float, s_z: float):
         super().__init__(children=[])
@@ -33,7 +20,7 @@ class Cube(Shape3D):
     def __str__(self):
         params = f"{self.s_x:.3f},\n{self.s_y:.3f},\n{self.s_z:.3f}"
         indented = textwrap.indent(params, "    ")
-        return f"Cube(\n{indented}\n)"
+        return f"Rect3D(\n{indented}\n)"
 
     def get_box3d_list(self) -> list[Box3D]:
         return [
@@ -44,11 +31,11 @@ class Cube(Shape3D):
         ]
 
     def param_tuple(self):
-        return Cube, (self.s_x, self.s_y, self.s_z)
+        return Rect3D, (self.s_x, self.s_y, self.s_z)
 
 
 class Move3D(Shape3D):
-    """Translates a child shape in 3D space."""
+    """Translate child shape in 3D."""
 
     def __init__(self, child: Shape3D, t_x: float, t_y: float, t_z: float):
         super().__init__(children=[child])
@@ -73,7 +60,7 @@ class Move3D(Shape3D):
 
 
 class Union3D(Shape3D):
-    """Union of two child shapes."""
+    """Union of two shapes."""
 
     def __init__(self, child1: Shape3D, child2: Shape3D):
         if not isinstance(child1, Shape3D) or not isinstance(child2, Shape3D):
@@ -93,9 +80,7 @@ class Union3D(Shape3D):
 
 
 class SymTrans3D(Shape3D):
-    """
-    Symmetric translation of a child along a given axis ('x', 'y', or 'z').
-    """
+    """Symmetric translation along axis."""
 
     def __init__(self, child: Shape3D, axis: str, dist: float, degree: int):
         super().__init__(children=[child])
@@ -112,10 +97,10 @@ class SymTrans3D(Shape3D):
     def get_box3d_list(self) -> list[Box3D]:
         child_boxes = self.children[0].get_box3d_list()
         axis_map = {"x": 0, "y": 1, "z": 2}
-        copies = []
         if self.axis not in axis_map:
             raise ValueError("Axis must be 'x', 'y', or 'z'")
         idx = axis_map[self.axis]
+        copies = []
         for box in child_boxes:
             for i in range(self.degree - 1):
                 offset = torch.zeros(3)
@@ -128,9 +113,7 @@ class SymTrans3D(Shape3D):
 
 
 class SymRef3D(Shape3D):
-    """
-    Symmetric reflection of a child shape about a plane (x=0, y=0, or z=0).
-    """
+    """Symmetric reflection about axis plane."""
 
     def __init__(self, child: Shape3D, axis: str):
         super().__init__(children=[child])
