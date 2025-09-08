@@ -2,6 +2,7 @@
 # coding: utf-8
 
 # In[5]:
+# In[11]:
 
 
 # List all subfolders in the Chair directory
@@ -16,6 +17,7 @@ for folder in sorted(subfolders):
 
 
 # In[6]:
+# In[12]:
 
 
 # Explore the contents of the boxes subfolder
@@ -57,6 +59,7 @@ else:
 
 
 # In[7]:
+# In[13]:
 
 
 # Helper functions for exploring the GRASS dataset
@@ -136,6 +139,7 @@ if label_files:
 
 
 # In[8]:
+# In[14]:
 
 
 # Tree structure implementation for hierarchical representation
@@ -524,6 +528,9 @@ class GRASSDatasetExplorer:
                                      [corners[start,1], corners[end,1]],
                                      [corners[start,2], corners[end,2]],
                                      color=colors[i], linewidth=2)
+                                   [corners[start,1], corners[end,1]],
+                                   [corners[start,2], corners[end,2]],
+                                   color=colors[i], linewidth=2)
 
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
@@ -576,6 +583,8 @@ class GRASSDatasetExplorer:
                     ax.plot_trisurf(mesh.vertices[:,0], mesh.vertices[:,1], 
                                      mesh.vertices[:,2], triangles=mesh.faces,
                                      alpha=0.8, cmap='viridis')
+                                   mesh.vertices[:,2], triangles=mesh.faces,
+                                   alpha=0.8, cmap='viridis')
 
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
