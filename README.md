@@ -25,3 +25,10 @@ project-root/
     └── abstractionssymh/     # Abstractions for PartNet_symh dataset
 
 ```
+
+# Steps
+
+1. Copy the folders like `Bag`, `Bottle`, `Chair` etc from [github.com/FENGGENYU/PartNet_symh](github.com/FENGGENYU/PartNet_symh) to `PartNet_symh/dropbox` folder
+2. Run the `PartNet_symh/dataset_to_json.ipynb` file to generate the json files in `PartNet_symh/dataset` folder
+3. Copy the contents of `PartNet_symh/dataset` folder to `src/abstractionssymh/dataset` folder
+4. Run `notebookssymh/abstraction_demo.ipynb`
