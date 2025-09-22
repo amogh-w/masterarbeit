@@ -3,3 +3,6 @@ __pycache__
 PartNet_symh/dropbox
 PartNet_symh/dataset
 src/abstractionssymh/dataset
+
+*.html
+*.pkl
