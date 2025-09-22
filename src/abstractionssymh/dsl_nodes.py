@@ -1,22 +1,23 @@
+"""
+dsl_nodes.py
+
+Definitions of DSL node types for 3D shape construction, including Box, Transformations (Scale, Rotate, Translate),
+Unions, and Symmetry operations (reflection, rotation, translation). Provides expand() and serialize() methods for all nodes.
+"""
+
 import textwrap
 import numpy as np
-import copy # <-- Import the copy module
+import copy
 from scipy.spatial.transform import Rotation
 
 
-# Helper to format vectors for printing
 def _format_vec(vec, precision=3):
-    """
-    Formats a list of numbers into a clean string, handling both single numbers
-    and lists of numbers.
-    """
     if isinstance(vec, (list, np.ndarray)):
         return f"[{', '.join(f'{x:.{precision}f}' for x in vec)}]"
     else:
         return f"{vec:.{precision}f}"
 
 
-# --- LEAF NODE (always a unit cube at the origin) ---
 class Box:
     def __init__(self, label: int):
         self.label = label
@@ -25,20 +26,19 @@ class Box:
         return f"Box(label={self.label})"
 
     def expand(self):
-        """Returns the dictionary for a single unit box at the origin."""
-        return [{
-            "center": np.array([0.0, 0.0, 0.0]),
-            "lengths": np.array([1.0, 1.0, 1.0]),
-            "quaternion": np.array([0.0, 0.0, 0.0, 1.0]), # Identity
-            "label_id": self.label,
-        }]
+        return [
+            {
+                "center": np.array([0.0, 0.0, 0.0]),
+                "lengths": np.array([1.0, 1.0, 1.0]),
+                "quaternion": np.array([0.0, 0.0, 0.0, 1.0]),
+                "label_id": self.label,
+            }
+        ]
 
     def serialize(self):
-        """Serializes the node into its type, float params, and other params."""
         return (Box, ([], [self.label]))
 
 
-# --- TRANSFORMATION NODES ---
 class Scale:
     def __init__(self, child, lengths):
         self.child = child
@@ -100,7 +100,6 @@ class Translate:
         return (Translate, (self.center.tolist(), [self.child]))
 
 
-# --- INTERNAL NODES ---
 class Union:
     def __init__(self, left, right):
         self.left = left
@@ -137,16 +136,14 @@ class SymRef(Symmetry):
         )
         child_str = textwrap.indent(str(self.child), "    ")
         return f"{info}(\n{child_str}\n)"
-        
+
     def expand(self):
         child_boxes = self.child.expand()
         generated_boxes = []
         plane_normal = self.plane / (np.linalg.norm(self.plane) + 1e-8)
 
         for box in child_boxes:
-            # *** FIX: Use copy.deepcopy for a robust copy ***
             reflected_box = copy.deepcopy(box)
-            
             vec_to_plane = box["center"] - self.point_on_plane
             dist = np.dot(vec_to_plane, plane_normal)
             reflected_box["center"] = box["center"] - 2 * dist * plane_normal
@@ -155,11 +152,10 @@ class SymRef(Symmetry):
             M_reflect = np.identity(3) - 2 * np.outer(plane_normal, plane_normal)
             R_new = M_reflect @ R_orig
             if np.linalg.det(R_new) < 0:
-                R_new[:, 0] *= -1 # Correct for improper rotation
-            
+                R_new[:, 0] *= -1
             reflected_box["quaternion"] = Rotation.from_matrix(R_new).as_quat()
             generated_boxes.append(reflected_box)
-            
+
         return child_boxes + generated_boxes
 
     def serialize(self):
@@ -183,7 +179,7 @@ class SymRot(Symmetry):
         )
         child_str = textwrap.indent(str(self.child), "    ")
         return f"{info}(\n{child_str}\n)"
-        
+
     def expand(self):
         child_boxes = self.child.expand()
         generated_boxes = []
@@ -193,11 +189,11 @@ class SymRot(Symmetry):
             angle = 2 * np.pi * i / self.n
             symmetry_rot = Rotation.from_rotvec(angle * axis)
             for box in child_boxes:
-                # *** FIX: Use copy.deepcopy for a robust copy ***
                 rotated_box = copy.deepcopy(box)
-
                 vec_from_center = box["center"] - self.center
-                rotated_box["center"] = self.center + symmetry_rot.apply(vec_from_center)
+                rotated_box["center"] = self.center + symmetry_rot.apply(
+                    vec_from_center
+                )
                 original_rot = Rotation.from_quat(box["quaternion"])
                 rotated_box["quaternion"] = (symmetry_rot * original_rot).as_quat()
                 generated_boxes.append(rotated_box)
@@ -228,17 +224,15 @@ class SymTrans(Symmetry):
         child_boxes = self.child.expand()
         if not child_boxes:
             return []
-            
+
         generated_boxes = []
         for i in range(1, self.n):
             total_translation = i * self.end_point
             for box in child_boxes:
-                # *** FIX: Use copy.deepcopy for a robust copy ***
                 translated_box = copy.deepcopy(box)
-                
                 translated_box["center"] = box["center"] + total_translation
                 generated_boxes.append(translated_box)
-        
+
         return child_boxes + generated_boxes
 
     def serialize(self):

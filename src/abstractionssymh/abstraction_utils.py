@@ -1,151 +1,454 @@
 import torch
 import torch.nn as nn
-# Import all the DSL node classes you've defined
-from abstractionssymh.dsl_nodes import Box, Scale, Rotate, Translate, Union, SymRef, SymRot, SymTrans
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim import AdamW
+import textwrap
+
+from abstractionssymh.dsl_nodes import (
+    Box,
+    Scale,
+    Rotate,
+    Translate,
+    Union,
+    SymRef,
+    SymRot,
+    SymTrans,
+)
+from abstractionssymh.debug_utils import debug_info, debug_error, debug_success
 
 # ==============================================================================
-# 1. THE ABSTRACTION NODE
+# --- CONFIGURABLE PARAMETERS ---
 # ==============================================================================
+
+# --- Hardware Configuration ---
+# Set the device to use for tensor computations ('cuda' for GPU, 'cpu' for CPU).
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- Autoencoder Architecture ---
+# Defines the sizes of the intermediate layers in the autoencoder.
+# The network structure will be: input -> LAYER_1_SIZE -> LAYER_2_SIZE -> latent_space
+AUTOENCODER_LAYER_1_SIZE = 32
+AUTOENCODER_LAYER_2_SIZE = 16
+
+# --- Training Hyperparameters ---
+# Number of epochs to train each autoencoder model.
+EPOCHS = 50
+# Batch size for training the autoencoder.
+BATCH_SIZE = 64
+# Learning rate for the AdamW optimizer.
+LEARNING_RATE = 1e-3
+
+# --- Abstraction Finding Parameters ---
+# Minimum number of examples required to attempt creating an abstraction for a pattern.
+MIN_EXAMPLES_FOR_ABSTRACTION = 100
+# Number of times to retrain the autoencoder, filtering out poorly-explained examples each time.
+RETRAIN_ITERATIONS = 3
+# Maximum reconstruction error for an example to be considered "well-explained" by the autoencoder.
+# This threshold is used both for filtering during training and for deciding when to abstract a node.
+ERROR_THRESHOLD = 0.05
+
+# ==============================================================================
+# --- CORE LOGIC ---
+# ==============================================================================
+
+
+def t(tensor):
+    """Convenience function to move a tensor to the configured device."""
+    return tensor.to(DEVICE)
+
+
+class Autoencoder(nn.Module):
+    """Simple fully-connected autoencoder with configurable hidden dim."""
+
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        debug_info(
+            f"Initializing Autoencoder: input_dim={input_dim}, hidden_dim={hidden_dim}"
+        )
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, AUTOENCODER_LAYER_1_SIZE),
+            nn.ReLU(),
+            nn.Linear(AUTOENCODER_LAYER_1_SIZE, AUTOENCODER_LAYER_2_SIZE),
+            nn.ReLU(),
+            nn.Linear(AUTOENCODER_LAYER_2_SIZE, hidden_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, AUTOENCODER_LAYER_2_SIZE),
+            nn.ReLU(),
+            nn.Linear(AUTOENCODER_LAYER_2_SIZE, AUTOENCODER_LAYER_1_SIZE),
+            nn.ReLU(),
+            nn.Linear(AUTOENCODER_LAYER_1_SIZE, input_dim),
+        )
+
+        debug_success("Autoencoder initialized successfully.")
+
+    def forward(self, x):
+        latent = self.encoder(x)
+        decoded = self.decoder(latent)
+        return latent, decoded
+
+
+def instantiate_pattern(pattern_name, params, children):
+    """
+    Rebuilds a DSL sub-tree from its pattern name, parameters, and preserved children.
+    Handles both SINGLETON and PAIR patterns.
+    """
+    debug_info(
+        f"[INSTANTIATE] Pattern: '{pattern_name}' | params={params[:10]}{'...' if len(params)>10 else ''} | #children={len(children)}"
+    )
+
+    # Registry defining parent parameter lengths for known PAIRS
+    param_split = {
+        "Scale(Box)": 3,
+        "Rotate(Scale)": 4,
+        "Translate(Rotate)": 3,
+        "Union(Translate)": 0,
+        "Union(SymRef)": 0,
+        "Union(SymRot)": 0,
+        "Union(SymTrans)": 0,
+        "SymRef(Union)": 6,
+        "SymRef(Translate)": 6,
+        "SymRot(Union)": 6,
+        "SymRot(Translate)": 6,
+        "SymTrans(Translate)": 3,
+    }
+
+    # --- SINGLETON RECONSTRUCTION ---
+    if pattern_name in ["Scale", "Rotate", "Translate", "SymRef", "SymRot", "SymTrans"]:
+        NodeClass = globals()[pattern_name]
+        child_node = children[0] if children else Box(-1)
+
+        if NodeClass == SymRef:
+            debug_info(f"  [SINGLETON] SymRef with params length {len(params)}")
+            return SymRef(
+                child_node, plane_normal=params[:3], point_on_plane=params[3:]
+            )
+        if NodeClass == SymRot:
+            debug_info(f"  [SINGLETON] SymRot with params length {len(params)}")
+            return SymRot(child_node, axis=params[:3], center=params[3:], n_fold=-1)
+        if NodeClass == SymTrans:
+            debug_info(f"  [SINGLETON] SymTrans with params length {len(params)}")
+            return SymTrans(child_node, end_point=params, n_fold=-1)
+
+        return NodeClass(child_node, params)
+
+    # --- PAIR RECONSTRUCTION ---
+    elif pattern_name in param_split:
+        p_len = param_split[pattern_name]
+        p_params, c_params = params[:p_len], params[p_len:]
+        parent_name, child_name = (
+            pattern_name.split("(")[0],
+            pattern_name.split("(")[1][:-1],
+        )
+        ParentClass, ChildClass = globals()[parent_name], globals()[child_name]
+
+        # --- Build child node ---
+        grandchild_node = children[0] if children else Box(-1)
+        if ChildClass == Box:
+            child_node = Box(-1)
+        elif ChildClass == Union:
+            if len(children) >= 2:
+                child_node = Union(children[0], children[1])
+            else:
+                debug_error(f"  [PAIR] Unexpected children for Union in {pattern_name}")
+                child_node = Box(-1)
+        elif ChildClass == SymRef:
+            child_node = SymRef(
+                grandchild_node, plane_normal=c_params[:3], point_on_plane=c_params[3:]
+            )
+        elif ChildClass == SymRot:
+            child_node = SymRot(
+                grandchild_node, axis=c_params[:3], center=c_params[3:], n_fold=-1
+            )
+        elif ChildClass == SymTrans:
+            child_node = SymTrans(grandchild_node, end_point=c_params, n_fold=-1)
+        else:
+            child_node = ChildClass(grandchild_node, c_params)
+
+        # --- Build parent node ---
+        if ParentClass == Union:
+            if len(children) >= 2:
+                return Union(child_node, children[1])
+            else:
+                debug_error(
+                    f"  [PAIR] Union parent with missing second child in {pattern_name}"
+                )
+                return Box(-1)
+        elif ParentClass == SymRef:
+            return SymRef(
+                child_node, plane_normal=p_params[:3], point_on_plane=p_params[3:]
+            )
+        elif ParentClass == SymRot:
+            return SymRot(child_node, axis=p_params[:3], center=p_params[3:], n_fold=-1)
+        elif ParentClass == SymTrans:
+            return SymTrans(child_node, end_point=p_params, n_fold=-1)
+        else:
+            return ParentClass(child_node, p_params)
+
+    debug_error(f"[UNKNOWN PATTERN] '{pattern_name}', defaulting to Box(-1)")
+    return Box(-1)
+
 
 class Abstraction:
-    """
-    A special DSL node that holds a compressed representation of a sub-tree.
-    It uses a trained neural network decoder to expand itself back into the
-    original, full sub-tree on demand.
-    """
-    def __init__(self, signature, compressed_params, other_params, decoder: nn.Module):
-        self.signature = signature
-        self.compressed_params = torch.tensor(compressed_params, dtype=torch.float32)
-        self.other_params = other_params
-        self.decoder = decoder
-        # Put the decoder in evaluation mode
-        self.decoder.eval()
+    def __init__(self, pattern_name, compressed_params, model, children=None):
+        self.pattern_name, self.compressed_params, self.model = (
+            pattern_name,
+            compressed_params,
+            model,
+        )
+        self.children = children if children is not None else []
+
+    def __str__(self):
+        header = f"Abs({self.pattern_name}, dim={len(self.compressed_params)})"
+        if not self.children:
+            return header
+        else:
+            child_strs = [textwrap.indent(str(c), "    ") for c in self.children]
+            return f"{header}(\n" + ",\n".join(child_strs) + "\n)"
+
+    __repr__ = __str__
 
     def expand(self):
-        """
-        The core method: decompress parameters and instantiate the full shape.
-        """
+        """Reconstructs the full DSL node from compressed parameters."""
+        debug_info(f"Expanding abstraction: {self}")
+        if not self.compressed_params:
+            debug_error("No compressed params found. Returning Box(-1).")
+            return Box(-1)
+
+        self.model.eval()
         with torch.no_grad():
-            reconstructed_floats = self.decoder(self.compressed_params).cpu().numpy().tolist()
-        
-        # Create copies of the lists to avoid modifying them during instantiation
-        type_list = signature_to_type_list(self.signature)
-        other_params_copy = self.other_params[:]
-        
-        # Rebuild the full shape from the decompressed parameters
-        full_shape = instantiate(type_list, reconstructed_floats, other_params_copy)
-        return full_shape.expand()
+            params_tensor = t(
+                torch.tensor(self.compressed_params, dtype=torch.float32)
+            ).unsqueeze(0)
+            debug_info(f"Compressed params tensor shape: {tuple(params_tensor.shape)}")
+            reconstructed_params = self.model.decoder(params_tensor).squeeze().tolist()
+            debug_success(f"Reconstructed params: {reconstructed_params}")
 
-    def serialize(self):
-        """ An Abstraction node serializes to itself. """
-        return (Abstraction, ([], [self]))
-        
-    def __str__(self):
-        return f"Abstraction(sig={self.signature}, params={self.compressed_params.shape})"
-
-# ==============================================================================
-# 2. HELPER FUNCTIONS FOR SERIALIZATION AND DESERIALIZATION
-# ==============================================================================
-
-def instantiate(type_list, float_params, other_params):
-    """
-    Recursively builds a DSL object tree from serialized lists of types and parameters.
-    This is the inverse of the .serialize() and flatten_for_params() methods.
-    """
-    if not type_list:
-        raise ValueError("Type list is empty, cannot instantiate.")
-
-    type_class = type_list.pop(0)
-
-    # Base case
-    if type_class == Box:
-        label = other_params.pop(0)
-        return Box(label=label)
-
-    # Recursive cases for single-child nodes
-    elif type_class in [Scale, Rotate, Translate, SymRef, SymRot, SymTrans]:
-        if type_class == Scale:
-            params = float_params[:3]; del float_params[:3]
-            child = instantiate(type_list, float_params, other_params)
-            return Scale(child=child, lengths=params)
-        elif type_class == Rotate:
-            params = float_params[:4]; del float_params[:4]
-            child = instantiate(type_list, float_params, other_params)
-            return Rotate(child=child, quaternion=params)
-        elif type_class == Translate:
-            params = float_params[:3]; del float_params[:3]
-            child = instantiate(type_list, float_params, other_params)
-            return Translate(child=child, center=params)
-        elif type_class == SymRef:
-            params = float_params[:6]; del float_params[:6]
-            child = instantiate(type_list, float_params, other_params)
-            return SymRef(child=child, plane_normal=params[:3], point_on_plane=params[3:])
-        elif type_class == SymRot:
-            params = float_params[:6]; del float_params[:6]
-            n_fold = other_params.pop(0)
-            child = instantiate(type_list, float_params, other_params)
-            return SymRot(child=child, axis=params[:3], center=params[3:], n_fold=n_fold)
-        elif type_class == SymTrans:
-            params = float_params[:3]; del float_params[:3]
-            n_fold = other_params.pop(0)
-            child = instantiate(type_list, float_params, other_params)
-            return SymTrans(child=child, end_point=params, n_fold=n_fold)
-
-    # Recursive case for two-child node
-    elif type_class == Union:
-        left_child = instantiate(type_list, float_params, other_params)
-        right_child = instantiate(type_list, float_params, other_params)
-        return Union(left=left_child, right=right_child)
-
-    raise ValueError(f"Unknown type class for instantiation: {type_class}")
+        rebuilt_node = instantiate_pattern(
+            self.pattern_name, reconstructed_params, self.children
+        )
+        debug_success(f"Successfully rebuilt node: {rebuilt_node}")
+        return rebuilt_node.expand()
 
 
-def get_pattern_signature(dsl_node):
-    """
-    Recursively traverses a DSL node and returns a nested tuple of its types.
-    This unique signature is used as a key to group identical structures.
-    Example: (Union, (Translate, (Box,)), (Scale, (Box,)))
-    """
-    node_type, (_, other_params_and_children) = dsl_node.serialize()
-    
-    # *** FIXED LOGIC HERE ***
-    # Only recurse into items that are actual DSL nodes (not integers)
-    child_signatures = tuple(
-        get_pattern_signature(item) 
-        for item in other_params_and_children if hasattr(item, 'serialize')
+def prepare_autoencoder_train_data(parameters, mask, batch_size=BATCH_SIZE):
+    """Creates a DataLoader from parameters and a boolean mask."""
+    debug_info(
+        f"Preparing DataLoader: batch_size={batch_size}, mask sum={mask.sum().item()}"
     )
-    
-    return (node_type,) + child_signatures
+    tensor = t(torch.tensor(parameters, dtype=torch.float32))
+    if mask.shape[0] != tensor.shape[0]:
+        debug_error(
+            f"Mask size {mask.shape[0]} does not match data size {tensor.shape[0]}"
+        )
+        raise ValueError(f"Mask size {mask.shape[0]} != data size {tensor.shape[0]}")
+    dataloader = DataLoader(
+        TensorDataset(tensor[mask]), batch_size=batch_size, shuffle=True
+    )
+    debug_success("DataLoader prepared successfully.")
+    return dataloader
 
 
-def flatten_for_params(dsl_node):
-    """
-    Recursively traverses a DSL node and flattens its parameters into two lists:
-    1. A list of all floating-point numbers.
-    2. A list of all other parameters (e.g., labels, n_fold integers).
-    """
-    _ , (float_params, other_params_and_children) = dsl_node.serialize()
-    
-    all_floats = list(float_params)
-    all_others = []
-
-    for item in other_params_and_children:
-        # Check if the item is a DSL node by seeing if it has a 'serialize' method
-        if hasattr(item, 'serialize'):
-            child_floats, child_others = flatten_for_params(item)
-            all_floats.extend(child_floats)
-            all_others.extend(child_others)
-        else: # It's a non-node parameter (like a label or n_fold)
-             all_others.append(item)
-            
-    return all_floats, all_others
+def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD):
+    """Checks if parameters are well reconstructed by the autoencoder."""
+    model.eval()
+    with torch.no_grad():
+        _, reconstructions = model(parameters_tensor)
+        error, _ = torch.max(torch.abs(reconstructions - parameters_tensor), dim=-1)
+    debug_info(f"Max reconstruction error per sample: {error}")
+    well_explained = error < error_threshold
+    debug_info(
+        f"Number of well-explained examples: {well_explained.sum().item()}/{len(well_explained)}"
+    )
+    return well_explained
 
 
-def signature_to_type_list(signature):
-    """
-    Converts a nested signature tuple back into a flat list of types for instantiation.
-    """
-    type_list = [signature[0]]
-    for child_sig in signature[1:]:
-        type_list.extend(signature_to_type_list(child_sig))
-    return type_list
+def train_autoencoder(model, dataloader, epochs=EPOCHS, lr=LEARNING_RATE):
+    """Trains an autoencoder on the given DataLoader."""
+    debug_info(f"Training autoencoder for {epochs} epochs, learning rate={lr}")
+    optimizer = AdamW(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    model.train()
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for batch in dataloader:
+            x = batch[0].to(DEVICE)
+            optimizer.zero_grad()
+            _, x_rec = model(x)
+            loss = loss_fn(x_rec, x)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * x.size(0)
+        debug_info(
+            f"Epoch {epoch+1}/{epochs} - Average loss: {epoch_loss / len(dataloader.dataset):.6f}"
+        )
+
+    debug_success("Autoencoder training complete.")
+    return model
+
+
+def find_abstractions(
+    structures,
+    structure_type="PATTERNS",
+    min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
+    retrain_iterations=RETRAIN_ITERATIONS,
+    error_threshold=ERROR_THRESHOLD,
+    epochs=EPOCHS,
+):
+    """Trains autoencoders for each structure type and returns models."""
+    trained_models = {}
+    sorted_structures = sorted(
+        structures.items(), key=lambda item: len(item[1]), reverse=True
+    )
+
+    debug_info(
+        f"Finding abstractions for {len(sorted_structures)} structures of type {structure_type}"
+    )
+
+    for name, parameters in sorted_structures:
+        if len(parameters) < min_examples:
+            debug_info(f"Skipping {name} (only {len(parameters)} examples)")
+            continue
+
+        num_params = len(parameters[0])
+        if num_params <= 1:
+            debug_info(f"Skipping {name} (too few params: {num_params})")
+            continue
+
+        debug_success(
+            f"Training model for {name} with {len(parameters)} samples, {num_params} params"
+        )
+        params_tensor = t(torch.tensor(parameters, dtype=torch.float32))
+        mask = torch.ones(len(parameters), dtype=torch.bool)
+
+        for iteration in range(retrain_iterations):
+            if not mask.any():
+                debug_info(f"All {name} examples filtered out at iteration {iteration}")
+                break
+
+            debug_info(f"Iteration {iteration+1}/{retrain_iterations} for {name}")
+            dataloader = prepare_autoencoder_train_data(parameters, mask=mask)
+            model = Autoencoder(num_params, max(1, num_params - 1)).to(DEVICE)
+            model = train_autoencoder(model, dataloader, epochs=epochs)
+
+            mask = is_well_explained(model, params_tensor, error_threshold)
+
+        trained_models[name] = model
+        debug_success(
+            f"Model training finished for {name}. Total well-explained examples: {mask.sum().item()}/{len(parameters)}"
+        )
+
+    debug_success(f"Finished training {len(trained_models)} {structure_type}")
+    return trained_models
+
+
+def integrate_abstractions(
+    node, singleton_models, pair_models, error_threshold=ERROR_THRESHOLD, depth=0
+):
+    """Recursively traverses a DSL tree and replaces well-explained patterns with Abstraction nodes."""
+    indent = "  " * depth
+
+    if isinstance(node, Abstraction):
+        debug_info(
+            f"{indent}[Abstraction] Node already abstracted: {node.pattern_name}"
+        )
+        return node
+
+    # 1. Recurse to children first
+    _, (_, children) = node.serialize()
+    rebuilt_children = [
+        (
+            integrate_abstractions(
+                c, singleton_models, pair_models, error_threshold, depth + 1
+            )
+            if hasattr(c, "serialize")
+            else c
+        )
+        for c in children
+    ]
+
+    # 2. Rebuild current node with potentially abstracted children
+    try:
+        if isinstance(node, Union):
+            current_node = Union(rebuilt_children[0], rebuilt_children[1])
+        elif isinstance(node, SymRef):
+            current_node = SymRef(
+                rebuilt_children[0],
+                plane_normal=node.plane,
+                point_on_plane=node.point_on_plane,
+            )
+        elif isinstance(node, SymRot):
+            current_node = SymRot(
+                rebuilt_children[0], axis=node.axis, center=node.center, n_fold=node.n
+            )
+        elif isinstance(node, SymTrans):
+            current_node = SymTrans(
+                rebuilt_children[0], end_point=node.end_point, n_fold=node.n
+            )
+        elif hasattr(node, "child"):
+            kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
+            current_node = type(node)(rebuilt_children[0], **kwargs)
+        else:
+            current_node = type(node)(*rebuilt_children)
+        debug_info(
+            f"{indent}[Rebuilt] {type(current_node).__name__} with {len(rebuilt_children)} children"
+        )
+    except Exception as e:
+        debug_error(
+            f"{indent}[Rebuild FAILED] {type(node).__name__} at depth {depth}: {e}"
+        )
+        return node
+
+    # 3. Try to abstract the current node as part of a PAIR
+    child_nodes = [c for c in rebuilt_children if hasattr(c, "serialize")]
+    if len(child_nodes) == 1:
+        child_node = child_nodes[0]
+        if not isinstance(child_node, Abstraction):
+            pair_sig = f"{type(current_node).__name__}({type(child_node).__name__})"
+            if pair_sig in pair_models:
+                model, (p_params, _), (c_params, c_children) = (
+                    pair_models[pair_sig],
+                    current_node.serialize()[1],
+                    child_node.serialize()[1],
+                )
+                if p_params + c_params:
+                    combined = t(
+                        torch.tensor(p_params + c_params, dtype=torch.float32)
+                    ).unsqueeze(0)
+                    _, reconstruction = model(combined)
+                    error = torch.max(torch.abs(reconstruction - combined)).item()
+                    debug_info(f"{indent}[PAIR CHECK] {pair_sig}, error={error:.4f}")
+                    if error < error_threshold:
+                        encoding, _ = model(combined)
+                        grandchildren = [
+                            c for c in c_children if hasattr(c, "serialize")
+                        ]
+                        debug_success(f"{indent}[PAIR ABSTRACTION CREATED] {pair_sig}")
+                        return Abstraction(
+                            pair_sig,
+                            encoding.squeeze().tolist(),
+                            model,
+                            children=grandchildren,
+                        )
+
+    # 4. Try to abstract the current node as a SINGLETON
+    name = type(current_node).__name__
+    if name in singleton_models:
+        model, (p_params, _) = singleton_models[name], current_node.serialize()[1]
+        if p_params:
+            params_tensor = t(torch.tensor(p_params, dtype=torch.float32)).unsqueeze(0)
+            _, reconstruction = model(params_tensor)
+            error = torch.max(torch.abs(reconstruction - params_tensor)).item()
+            debug_info(f"{indent}[SINGLETON CHECK] {name}, error={error:.4f}")
+            if error < error_threshold:
+                encoding, _ = model(params_tensor)
+                debug_success(f"{indent}[SINGLETON ABSTRACTION CREATED] {name}")
+                return Abstraction(
+                    name, encoding.squeeze().tolist(), model, children=child_nodes
+                )
+
+    # 5. No abstraction was applicable, return the rebuilt node
+    debug_info(f"{indent}[RETURN NODE] {type(current_node).__name__}")
+    return current_node
