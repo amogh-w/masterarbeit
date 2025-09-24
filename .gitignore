@@ -6,4 +6,6 @@ src/abstractionssymh/dataset
 
 *.html
 *.pkl
-src/abstractionssymh/saved/bruh
+
+src/abstractionssymh/saved/
+notebookssymh/assets/matplotlib/
