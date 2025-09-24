@@ -4,6 +4,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import AdamW
 import textwrap
 
+import matplotlib.pyplot as plt
+from IPython.display import display
+from pathlib import Path
+
 from abstractionssymh.dsl_nodes import (
     Box,
     Scale,
@@ -42,7 +46,7 @@ LEARNING_RATE = 1e-3
 # Minimum number of examples required to attempt creating an abstraction for a pattern.
 MIN_EXAMPLES_FOR_ABSTRACTION = 100
 # Number of times to retrain the autoencoder, filtering out poorly-explained examples each time.
-RETRAIN_ITERATIONS = 3
+RETRAIN_ITERATIONS = 1
 # Maximum reconstruction error for an example to be considered "well-explained" by the autoencoder.
 # This threshold is used both for filtering during training and for deciding when to abstract a node.
 ERROR_THRESHOLD = 0.05
@@ -264,12 +268,14 @@ def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD)
     return well_explained
 
 
-def train_autoencoder(model, dataloader, epochs=EPOCHS, lr=LEARNING_RATE):
-    """Trains an autoencoder on the given DataLoader."""
+def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE):
+    """Trains an autoencoder and plots and saves its loss curve."""
     debug_info(f"Training autoencoder for {epochs} epochs, learning rate={lr}")
     optimizer = AdamW(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
     model.train()
+    
+    epoch_losses = []
 
     for epoch in range(epochs):
         epoch_loss = 0.0
@@ -281,11 +287,47 @@ def train_autoencoder(model, dataloader, epochs=EPOCHS, lr=LEARNING_RATE):
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * x.size(0)
+        
+        avg_epoch_loss = epoch_loss / len(dataloader.dataset)
+        epoch_losses.append(avg_epoch_loss)
         debug_info(
-            f"Epoch {epoch+1}/{epochs} - Average loss: {epoch_loss / len(dataloader.dataset):.6f}"
+            f"Epoch {epoch+1}/{epochs} - Average loss: {avg_epoch_loss:.6f}"
         )
 
     debug_success("Autoencoder training complete.")
+    
+    # --- PLOTTING LOGIC ---
+    debug_info(f"Plotting training loss for model: {model_name}")
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
+    ax.plot(range(1, epochs + 1), epoch_losses, marker='o', linestyle='-', label='Training Loss')
+    ax.set_title(f"Training Loss for Model: {model_name}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Average MSE Loss")
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.legend()
+    # Ensure integer ticks for epochs, especially for smaller epoch counts
+    if epochs <= 25:
+        ax.set_xticks(range(1, epochs + 1))
+    fig.tight_layout()
+
+    # --- SAVING THE PLOT ---
+    try:
+        # Create a 'saved' directory relative to this file's location
+        save_dir = Path(__file__).parent / "saved"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Sanitize the model name to create a valid filename
+        safe_filename = model_name.replace("(", "_").replace(")", "").replace("/", "_") + "_loss_chart.png"
+        save_path = save_dir / safe_filename
+        
+        fig.savefig(save_path)
+        debug_success(f"Loss chart saved to: {save_path}")
+    except Exception as e:
+        debug_error(f"Failed to save loss chart: {e}")
+
+    plt.show() # Display the plot in interactive environments
+    plt.close(fig) # Close the figure to free up memory
+
     return model
 
 
@@ -331,7 +373,9 @@ def find_abstractions(
             debug_info(f"Iteration {iteration+1}/{retrain_iterations} for {name}")
             dataloader = prepare_autoencoder_train_data(parameters, mask=mask)
             model = Autoencoder(num_params, max(1, num_params - 1)).to(DEVICE)
-            model = train_autoencoder(model, dataloader, epochs=epochs)
+            
+            # --- FIX: Pass the 'name' of the pattern as the model_name for plotting ---
+            model = train_autoencoder(model, dataloader, model_name=name, epochs=epochs)
 
             mask = is_well_explained(model, params_tensor, error_threshold)
 

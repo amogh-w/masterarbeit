@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[12]:
+# In[54]:
 
 
 import sys
@@ -9,7 +9,7 @@ import os
 sys.path.append(os.path.abspath("../src"))
 
 
-# In[13]:
+# In[55]:
 
 
 DEBUG = True
@@ -32,7 +32,7 @@ def debug_success(*args):
         cprint(f"[SUCCESS] {' '.join(map(str, args))}", "green")
 
 
-# In[14]:
+# In[56]:
 
 
 from pathlib import Path
@@ -51,7 +51,7 @@ def get_dataset_directory():
 dataset_directory = get_dataset_directory()
 
 
-# In[15]:
+# In[57]:
 
 
 import random
@@ -74,10 +74,10 @@ def load_chair_dsl(chair_directory, use_random=False):
     return dsl_object
 
 chair_directory = dataset_directory / "Chair"
-dsl_object = load_chair_dsl(chair_directory, use_random=False)
+# dsl_object = load_chair_dsl(chair_directory, use_random=False)
 
 
-# In[16]:
+# In[58]:
 
 
 from abstractionssymh.plot_utils import plot_dsl_with_k3d
@@ -93,10 +93,10 @@ def plot_chair(dsl_obj):
     except Exception as e:
         debug_error("Failed to plot DSL object:", e)
 
-plot_chair(dsl_object)
+# plot_chair(dsl_object)
 
 
-# In[17]:
+# In[59]:
 
 
 from collections import defaultdict
@@ -110,7 +110,7 @@ def find_all_subtrees(node):
     yield node
 
 
-# In[18]:
+# In[60]:
 
 
 def collect_singleton_and_pair_data(dsl_shapes):
@@ -142,7 +142,7 @@ def collect_singleton_and_pair_data(dsl_shapes):
     return dict(sorted(s_data.items())), dict(sorted(p_data.items()))
 
 
-# In[19]:
+# In[61]:
 
 
 import torch
@@ -153,21 +153,13 @@ from abstractionssymh.dsl_nodes import Box, Scale, Rotate, Translate, Union, Sym
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-# In[20]:
-
-
-device
-
-
-# In[21]:
-
+debug_info("Using device:", device)
 
 def t(tensor):
     return tensor.to(device)
 
 
-# In[22]:
+# In[62]:
 
 
 class Autoencoder(nn.Module):
@@ -198,17 +190,97 @@ class Autoencoder(nn.Module):
         return latent, decoded
 
 
-# In[23]:
+# In[63]:
 
 
-def instantiate_pattern(pattern_name, params, children):
+# def instantiate_pattern(pattern_name, params, children):
+#     """
+#     Rebuilds a DSL sub-tree from its pattern name, parameters, and preserved children.
+#     Handles both SINGLETON and PAIR patterns.
+#     """
+#     debug_info(f"[INSTANTIATE] Pattern: '{pattern_name}' | params={params[:10]}{'...' if len(params)>10 else ''} | #children={len(children)}")
+
+#     # Registry defining parent parameter lengths for known PAIRS
+#     param_split = {
+#         'Scale(Box)': 3, 'Rotate(Scale)': 4, 'Translate(Rotate)': 3,
+#         'Union(Translate)': 0, 'Union(SymRef)': 0, 'Union(SymRot)': 0, 'Union(SymTrans)': 0,
+#         'SymRef(Union)': 6, 'SymRef(Translate)': 6, 'SymRot(Union)': 6,
+#         'SymRot(Translate)': 6, 'SymTrans(Translate)': 3
+#     }
+
+#     # --- SINGLETON RECONSTRUCTION ---
+#     if pattern_name in ['Scale', 'Rotate', 'Translate', 'SymRef', 'SymRot', 'SymTrans']:
+#         NodeClass = globals()[pattern_name]
+#         child_node = children[0] if children else Box(-1)
+
+#         if NodeClass == SymRef:
+#             debug_info(f"  [SINGLETON] SymRef with params length {len(params)}")
+#             return SymRef(child_node, plane_normal=params[:3], point_on_plane=params[3:])
+#         if NodeClass == SymRot:
+#             debug_info(f"  [SINGLETON] SymRot with params length {len(params)}")
+#             return SymRot(child_node, axis=params[:3], center=params[3:], n_fold=-1)
+#         if NodeClass == SymTrans:
+#             debug_info(f"  [SINGLETON] SymTrans with params length {len(params)}")
+#             return SymTrans(child_node, end_point=params, n_fold=-1)
+
+#         return NodeClass(child_node, params)
+
+#     # --- PAIR RECONSTRUCTION ---
+#     elif pattern_name in param_split:
+#         p_len = param_split[pattern_name]
+#         p_params, c_params = params[:p_len], params[p_len:]
+#         parent_name, child_name = pattern_name.split('(')[0], pattern_name.split('(')[1][:-1]
+#         ParentClass, ChildClass = globals()[parent_name], globals()[child_name]
+
+#         # --- Build child node ---
+#         grandchild_node = children[0] if children else Box(-1)
+#         if ChildClass == Box:
+#             child_node = Box(-1)
+#         elif ChildClass == Union:
+#             if len(children) >= 2:
+#                 child_node = Union(children[0], children[1])
+#             else:
+#                 debug_error(f"  [PAIR] Unexpected children for Union in {pattern_name}")
+#                 child_node = Box(-1)
+#         elif ChildClass == SymRef:
+#             child_node = SymRef(grandchild_node, plane_normal=c_params[:3], point_on_plane=c_params[3:])
+#         elif ChildClass == SymRot:
+#             child_node = SymRot(grandchild_node, axis=c_params[:3], center=c_params[3:], n_fold=-1)
+#         elif ChildClass == SymTrans:
+#             child_node = SymTrans(grandchild_node, end_point=c_params, n_fold=-1)
+#         else:
+#             child_node = ChildClass(grandchild_node, c_params)
+
+#         # --- Build parent node ---
+#         if ParentClass == Union:
+#             if len(children) >= 2:
+#                 return Union(child_node, children[1])
+#             else:
+#                 debug_error(f"  [PAIR] Union parent with missing second child in {pattern_name}")
+#                 return Box(-1)
+#         elif ParentClass == SymRef:
+#             return SymRef(child_node, plane_normal=p_params[:3], point_on_plane=p_params[3:])
+#         elif ParentClass == SymRot:
+#             return SymRot(child_node, axis=p_params[:3], center=p_params[3:], n_fold=-1)
+#         elif ParentClass == SymTrans:
+#             return SymTrans(child_node, end_point=p_params, n_fold=-1)
+#         else:
+#             return ParentClass(child_node, p_params)
+
+#     debug_error(f"[UNKNOWN PATTERN] '{pattern_name}', defaulting to Box(-1)")
+#     return Box(-1)
+
+
+# In[64]:
+
+
+def instantiate_pattern(pattern_name, params, children_and_params):
     """
-    Rebuilds a DSL sub-tree from its pattern name, parameters, and preserved children.
-    Handles both SINGLETON and PAIR patterns.
+    Rebuilds a DSL sub-tree from its pattern name, parameters, and preserved children/labels.
+    Handles SINGLETON and PAIR patterns, with support for SymRef, SymRot, SymTrans, Union, etc.
     """
-    debug_info(f"[INSTANTIATE] Pattern: '{pattern_name}' | params={params[:10]}{'...' if len(params)>10 else ''} | #children={len(children)}")
 
-    # Registry defining parent parameter lengths for known PAIRS
+    # Registry defining parameter splits for PAIR patterns
     param_split = {
         'Scale(Box)': 3, 'Rotate(Scale)': 4, 'Translate(Rotate)': 3,
         'Union(Translate)': 0, 'Union(SymRef)': 0, 'Union(SymRot)': 0, 'Union(SymTrans)': 0,
@@ -219,16 +291,13 @@ def instantiate_pattern(pattern_name, params, children):
     # --- SINGLETON RECONSTRUCTION ---
     if pattern_name in ['Scale', 'Rotate', 'Translate', 'SymRef', 'SymRot', 'SymTrans']:
         NodeClass = globals()[pattern_name]
-        child_node = children[0] if children else Box(-1)
+        child_node = children_and_params[0] if children_and_params else Box(-1)
 
         if NodeClass == SymRef:
-            debug_info(f"  [SINGLETON] SymRef with params length {len(params)}")
             return SymRef(child_node, plane_normal=params[:3], point_on_plane=params[3:])
         if NodeClass == SymRot:
-            debug_info(f"  [SINGLETON] SymRot with params length {len(params)}")
             return SymRot(child_node, axis=params[:3], center=params[3:], n_fold=-1)
         if NodeClass == SymTrans:
-            debug_info(f"  [SINGLETON] SymTrans with params length {len(params)}")
             return SymTrans(child_node, end_point=params, n_fold=-1)
 
         return NodeClass(child_node, params)
@@ -241,28 +310,35 @@ def instantiate_pattern(pattern_name, params, children):
         ParentClass, ChildClass = globals()[parent_name], globals()[child_name]
 
         # --- Build child node ---
-        grandchild_node = children[0] if children else Box(-1)
         if ChildClass == Box:
-            child_node = Box(-1)
+            # ✅ FIX: Preserve original Box label if available
+            label = children_and_params[0] if children_and_params and isinstance(children_and_params[0], int) else -1
+            child_node = Box(label)
+
         elif ChildClass == Union:
-            if len(children) >= 2:
-                child_node = Union(children[0], children[1])
+            if len(children_and_params) >= 2:
+                child_node = Union(children_and_params[0], children_and_params[1])
             else:
                 debug_error(f"  [PAIR] Unexpected children for Union in {pattern_name}")
                 child_node = Box(-1)
+
         elif ChildClass == SymRef:
+            grandchild_node = children_and_params[0] if children_and_params else Box(-1)
             child_node = SymRef(grandchild_node, plane_normal=c_params[:3], point_on_plane=c_params[3:])
         elif ChildClass == SymRot:
+            grandchild_node = children_and_params[0] if children_and_params else Box(-1)
             child_node = SymRot(grandchild_node, axis=c_params[:3], center=c_params[3:], n_fold=-1)
         elif ChildClass == SymTrans:
+            grandchild_node = children_and_params[0] if children_and_params else Box(-1)
             child_node = SymTrans(grandchild_node, end_point=c_params, n_fold=-1)
         else:
+            grandchild_node = children_and_params[0] if children_and_params else Box(-1)
             child_node = ChildClass(grandchild_node, c_params)
 
         # --- Build parent node ---
         if ParentClass == Union:
-            if len(children) >= 2:
-                return Union(child_node, children[1])
+            if len(children_and_params) >= 2:
+                return Union(child_node, children_and_params[1])
             else:
                 debug_error(f"  [PAIR] Union parent with missing second child in {pattern_name}")
                 return Box(-1)
@@ -275,59 +351,80 @@ def instantiate_pattern(pattern_name, params, children):
         else:
             return ParentClass(child_node, p_params)
 
+    # --- FALLBACK ---
     debug_error(f"[UNKNOWN PATTERN] '{pattern_name}', defaulting to Box(-1)")
     return Box(-1)
 
 
-# In[24]:
+# In[65]:
 
 
 import textwrap
 
+from termcolor import colored
+
+
+# def instantiate_pattern(pattern_name, params, children_and_params):
+#     param_split = {'Translate(Rotate)': 3, 'Rotate(Scale)': 4, 'Scale(Box)': 3, 'Union(Translate)': 0}
+#     if pattern_name in ['Scale', 'Rotate', 'Translate']:
+#         return globals()[pattern_name](children_and_params[0], params)
+#     elif pattern_name in param_split:
+#         p_len = param_split[pattern_name]
+#         p_params, c_params = params[:p_len], params[p_len:]
+#         parent_name, child_name = pattern_name.split('(')[0], pattern_name.split('(')[1][:-1]
+#         ParentClass, ChildClass = globals()[parent_name], globals()[child_name]
+
+#         if ChildClass == Box:
+#             # *** FIX IS HERE: Use the preserved label from children_and_params ***
+#             label = children_and_params[0] if children_and_params and isinstance(children_and_params[0], int) else -1
+#             child_node = Box(label)
+#         else:
+#             grandchild_node = children_and_params[0] if children_and_params else Box(-1)
+#             child_node = ChildClass(grandchild_node, c_params)
+
+#         if ParentClass == Union: return Union(child_node, children_and_params[1])
+#         else: return ParentClass(child_node, p_params)
+#     return Box(-1)
 
 class Abstraction:
-    def __init__(self, pattern_name, compressed_params, model, children=None):
+    def __init__(self, pattern_name, compressed_params, model, children_and_params=None):
         self.pattern_name, self.compressed_params, self.model = pattern_name, compressed_params, model
-        self.children = children if children is not None else []
-
+        self.children_and_params = children_and_params if children_and_params is not None else []
+    def serialize(self): return (type(self), ([], self.children_and_params))
     def __str__(self):
-        # Create the header for the Abstraction node
-        header = f"Abs({self.pattern_name}, dim={len(self.compressed_params)})"
+        # Show full parameter list
+        preview = ", ".join(f"{p:.3f}" for p in self.compressed_params) if self.compressed_params else "none"
 
-        # If the abstraction has preserved children, indent and print them
-        if not self.children:
+        # Build header string
+        header = colored(
+            f"Abs({self.pattern_name}, dim={len(self.compressed_params)}, params=[{preview}])",
+            'magenta', attrs=['bold']
+        )
+
+        # If no children, just return the header
+        if not self.children_and_params:
             return header
-        else:
-            # Indent each child's own string representation
-            child_strs = [textwrap.indent(str(c), '    ') for c in self.children]
-            # Join the indented child strings
-            return f"{header}(\n" + ",\n".join(child_strs) + "\n)"
 
-    __repr__ = __str__  # makes debugging in lists/dicts nicer
+        # Otherwise pretty-print children
+        child_strs = []
+        for c in self.children_and_params:
+            if isinstance(c, int):  # Box label
+                child_strs.append(textwrap.indent(f"Box(label={c})", '    '))
+            else:
+                child_strs.append(textwrap.indent(str(c), '    '))
 
+        return f"{header}(\n" + ",\n".join(child_strs) + "\n)"
+    __repr__ = __str__
     def expand(self):
-        """Reconstructs the full DSL node from compressed parameters."""
-        debug_info(f"Expanding abstraction: {self}")
-
-        if not self.compressed_params:
-            debug_error("No compressed params found. Returning Box(-1).")
-            return Box(-1)  # fallback if params are missing
-
         self.model.eval()
         with torch.no_grad():
-            params_tensor = t(torch.tensor(
-                self.compressed_params, dtype=torch.float32
-            )).unsqueeze(0)
-            debug_info(f"Compressed params tensor shape: {tuple(params_tensor.shape)}")
+            params_tensor = t(torch.tensor(self.compressed_params, dtype=torch.float32)).unsqueeze(0)
             reconstructed_params = self.model.decoder(params_tensor).squeeze().tolist()
-            debug_success(f"Reconstructed params: {reconstructed_params}")
-
-        rebuilt_node = instantiate_pattern(self.pattern_name, reconstructed_params, self.children)
-        debug_success(f"Successfully rebuilt node: {rebuilt_node}")
+        rebuilt_node = instantiate_pattern(self.pattern_name, reconstructed_params, self.children_and_params)
         return rebuilt_node.expand()
 
 
-# In[25]:
+# In[66]:
 
 
 def prepare_autoencoder_train_data(parameters, mask, batch_size=64):
@@ -342,7 +439,7 @@ def prepare_autoencoder_train_data(parameters, mask, batch_size=64):
     return dataloader
 
 
-# In[26]:
+# In[67]:
 
 
 def is_well_explained(model, parameters_tensor, error_threshold):
@@ -357,7 +454,7 @@ def is_well_explained(model, parameters_tensor, error_threshold):
     return well_explained
 
 
-# In[27]:
+# In[68]:
 
 
 def train_autoencoder(model, dataloader, epochs=50, lr=1e-3):
@@ -383,7 +480,7 @@ def train_autoencoder(model, dataloader, epochs=50, lr=1e-3):
     return model
 
 
-# In[28]:
+# In[69]:
 
 
 def find_abstractions(
@@ -433,45 +530,20 @@ def find_abstractions(
     return trained_models
 
 
-# In[29]:
+# In[70]:
 
 
-def integrate_abstractions(node, singleton_models, pair_models, error_threshold, depth=0):
-    indent = "  " * depth
-
-    if isinstance(node, Abstraction):
-        debug_info(f"{indent}[Abstraction] Node already abstracted: {node.pattern_name}")
-        return node
-
-    # 1. Recurse to children first
+def integrate_abstractions(node, singleton_models, pair_models, error_threshold=0.05):
+    if isinstance(node, Abstraction): return node
     _, (_, children) = node.serialize()
-    rebuilt_children = [
-        integrate_abstractions(c, singleton_models, pair_models, error_threshold, depth+1)
-        if hasattr(c, 'serialize') else c
-        for c in children
-    ]
+    rebuilt_children = [integrate_abstractions(c, singleton_models, pair_models, error_threshold) if hasattr(c, 'serialize') else c for c in children]
 
-    # 2. Rebuild current node
     try:
-        if isinstance(node, Union):
-            current_node = Union(rebuilt_children[0], rebuilt_children[1])
-        elif isinstance(node, SymRef):
-            current_node = SymRef(rebuilt_children[0], plane_normal=node.plane, point_on_plane=node.point_on_plane)
-        elif isinstance(node, SymRot):
-            current_node = SymRot(rebuilt_children[0], axis=node.axis, center=node.center, n_fold=node.n)
-        elif isinstance(node, SymTrans):
-            current_node = SymTrans(rebuilt_children[0], end_point=node.end_point, n_fold=node.n)
-        elif hasattr(node, 'child'):
-            kwargs = {k:v for k,v in node.__dict__.items() if k != 'child'}
-            current_node = type(node)(rebuilt_children[0], **kwargs)
-        else:
-            current_node = type(node)(*rebuilt_children)
-        debug_info(f"{indent}[Rebuilt] {type(current_node).__name__} with {len(rebuilt_children)} children")
-    except Exception as e:
-        debug_error(f"{indent}[Rebuild FAILED] {type(node).__name__} at depth {depth}: {e}")
-        return node
+        if isinstance(node, Union): current_node = Union(rebuilt_children[0], rebuilt_children[1])
+        elif hasattr(node, 'child'): current_node = type(node)(rebuilt_children[0], **{k:v for k,v in node.__dict__.items() if k != 'child'})
+        else: current_node = type(node)(*rebuilt_children)
+    except: current_node = node
 
-    # 3. Try pair abstraction
     child_nodes = [c for c in rebuilt_children if hasattr(c, 'serialize')]
     if len(child_nodes) == 1:
         child_node = child_nodes[0]
@@ -482,34 +554,24 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold,
                 if p_params + c_params:
                     combined = t(torch.tensor(p_params + c_params, dtype=torch.float32)).unsqueeze(0)
                     _, reconstruction = model(combined)
-                    error = torch.max(torch.abs(reconstruction - combined)).item()
-                    debug_info(f"{indent}[PAIR CHECK] {pair_sig}, error={error:.4f}")
-                    if error < error_threshold:
+                    if torch.max(torch.abs(reconstruction - combined)).item() < error_threshold:
                         encoding, _ = model(combined)
-                        grandchildren = [c for c in c_children if hasattr(c, 'serialize')]
-                        debug_success(f"{indent}[PAIR ABSTRACTION CREATED] {pair_sig}")
-                        return Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
+                        # *** FIX IS HERE: Preserve ALL of the child's non-float data ***
+                        return Abstraction(pair_sig, encoding.squeeze().tolist(), model, children_and_params=c_children)
 
-    # 4. Try singleton abstraction
     name = type(current_node).__name__
     if name in singleton_models:
-        model, (p_params, _) = singleton_models[name], current_node.serialize()[1]
+        model, (p_params, p_children) = singleton_models[name], current_node.serialize()[1]
         if p_params:
             params_tensor = t(torch.tensor(p_params, dtype=torch.float32)).unsqueeze(0)
             _, reconstruction = model(params_tensor)
-            error = torch.max(torch.abs(reconstruction - params_tensor)).item()
-            debug_info(f"{indent}[SINGLETON CHECK] {name}, error={error:.4f}")
-            if error < error_threshold:
+            if torch.max(torch.abs(reconstruction - params_tensor)).item() < error_threshold:
                 encoding, _ = model(params_tensor)
-                debug_success(f"{indent}[SINGLETON ABSTRACTION CREATED] {name}")
-                return Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
-
-    # 5. No abstraction, return rebuilt node
-    debug_info(f"{indent}[RETURN NODE] {type(current_node).__name__}")
+                return Abstraction(name, encoding.squeeze().tolist(), model, children_and_params=rebuilt_children)
     return current_node
 
 
-# In[30]:
+# In[71]:
 
 
 # Load DSL shapes
@@ -519,7 +581,7 @@ json_files = sorted(list(chair_directory.glob("*.json")))
 
 try:
     debug_info("Starting to load DSL shapes from JSON files...")
-    all_dsl_shapes = [parse_json_to_dsl(Path(f).read_text()) for f in json_files[:1000]]
+    all_dsl_shapes = [parse_json_to_dsl(Path(f).read_text()) for f in json_files[:100]]
     debug_success(f"Loaded {len(all_dsl_shapes)} shapes from dataset.")
 except Exception as e:
     debug_error("Failed to load DSL shapes:", e)
@@ -554,12 +616,12 @@ else:
     debug_error("No DSL shapes available. Abstraction pipeline skipped.")
 
 
-# In[36]:
+# In[76]:
 
 
 # Test on a random DSL shape
 if all_dsl_shapes and singleton_models and pair_models:
-    random_chair = random.choice(all_dsl_shapes)
+    random_chair = random.choice(all_dsl_shapes[:100])
     debug_info("--- ORIGINAL CHAIR ---")
     debug_info(f"Type: {type(random_chair).__name__}")
     debug_info(f"Serialized children count: {len(random_chair.serialize()[1][1])}")
@@ -589,20 +651,44 @@ else:
     debug_error("Cannot run test: DSL shapes or trained models are missing.")
 
 
-# In[37]:
+# In[73]:
 
 
-print(abstracted_chair)
+# # Test on a random DSL shape
+# if all_dsl_shapes and singleton_models and pair_models:
+#     random_chair = all_dsl_shapes[100]
+#     debug_info("--- ORIGINAL CHAIR ---")
+#     debug_info(f"Type: {type(random_chair).__name__}")
+#     debug_info(f"Serialized children count: {len(random_chair.serialize()[1][1])}")
+#     debug_info(f"Preview: {random_chair}")
+
+#     # Integrate abstractions
+#     debug_info("Integrating abstractions...")
+#     abstracted_chair = integrate_abstractions(
+#         random_chair, singleton_models, pair_models, error_threshold=0.01
+#     )
+
+#     debug_info("\n--- ABSTRACTED CHAIR ---")
+#     debug_info(f"Type: {type(abstracted_chair).__name__}")
+#     if isinstance(abstracted_chair, Abstraction):
+#         debug_info(f"Abstraction pattern: {abstracted_chair.pattern_name}, compressed dim: {len(abstracted_chair.compressed_params)}")
+#     debug_info(f"Preview: {abstracted_chair}")
+
+#     # Visualization
+#     try:
+#         debug_info("Plotting original and abstracted DSL shapes...")
+#         plot_dsl_with_k3d(random_chair)
+#         plot_dsl_with_k3d(abstracted_chair)
+#         debug_success("Visualization complete.")
+#     except Exception as e:
+#         debug_error("Plotting failed:", e)
+# else:
+#     debug_error("Cannot run test: DSL shapes or trained models are missing.")
 
 
-# In[38]:
+# In[74]:
 
 
-print(random_chair)
-
-
-# In[ ]:
-
-
-
+# print(random_chair)
+# print(abstracted_chair)
 
