@@ -3,9 +3,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import AdamW
 import textwrap
-
 import matplotlib.pyplot as plt
-from IPython.display import display
 from pathlib import Path
 
 from abstractionssymh.dsl_nodes import (
@@ -24,31 +22,14 @@ from abstractionssymh.debug_utils import debug_info, debug_error, debug_success
 # --- CONFIGURABLE PARAMETERS ---
 # ==============================================================================
 
-# --- Hardware Configuration ---
-# Set the device to use for tensor computations ('cuda' for GPU, 'cpu' for CPU).
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# --- Autoencoder Architecture ---
-# Defines the sizes of the intermediate layers in the autoencoder.
-# The network structure will be: input -> LAYER_1_SIZE -> LAYER_2_SIZE -> latent_space
 AUTOENCODER_LAYER_1_SIZE = 32
 AUTOENCODER_LAYER_2_SIZE = 16
-
-# --- Training Hyperparameters ---
-# Number of epochs to train each autoencoder model.
 EPOCHS = 50
-# Batch size for training the autoencoder.
 BATCH_SIZE = 64
-# Learning rate for the AdamW optimizer.
 LEARNING_RATE = 1e-3
-
-# --- Abstraction Finding Parameters ---
-# Minimum number of examples required to attempt creating an abstraction for a pattern.
 MIN_EXAMPLES_FOR_ABSTRACTION = 100
-# Number of times to retrain the autoencoder, filtering out poorly-explained examples each time.
 RETRAIN_ITERATIONS = 1
-# Maximum reconstruction error for an example to be considered "well-explained" by the autoencoder.
-# This threshold is used both for filtering during training and for deciding when to abstract a node.
 ERROR_THRESHOLD = 0.05
 
 # ==============================================================================
@@ -57,18 +38,29 @@ ERROR_THRESHOLD = 0.05
 
 
 def t(tensor):
-    """Convenience function to move a tensor to the configured device."""
+    """Moves a tensor to the configured device.
+
+    Args:
+        tensor (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Tensor on DEVICE.
+    """
     return tensor.to(DEVICE)
 
 
 class Autoencoder(nn.Module):
-    """Simple fully-connected autoencoder with configurable hidden dim."""
+    """Simple fully-connected autoencoder with configurable hidden dimension."""
 
-    def __init__(self, input_dim: int, hidden_dim: int):
+    def __init__(self, input_dim, hidden_dim):
+        """Initializes encoder and decoder layers.
+
+        Args:
+            input_dim (int): Dimension of input features.
+            hidden_dim (int): Dimension of latent space.
+        """
         super().__init__()
-        debug_info(
-            f"Initializing Autoencoder: input_dim={input_dim}, hidden_dim={hidden_dim}"
-        )
+        debug_info(f"Initializing Autoencoder: input_dim={input_dim}, hidden_dim={hidden_dim}")
 
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, AUTOENCODER_LAYER_1_SIZE),
@@ -84,25 +76,43 @@ class Autoencoder(nn.Module):
             nn.ReLU(),
             nn.Linear(AUTOENCODER_LAYER_1_SIZE, input_dim),
         )
-
         debug_success("Autoencoder initialized successfully.")
 
     def forward(self, x):
+        """Performs a forward pass through the encoder and decoder.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Latent representation and reconstruction.
+        """
         latent = self.encoder(x)
         decoded = self.decoder(latent)
         return latent, decoded
 
 
 def instantiate_pattern(pattern_name, params, children):
-    """
-    Rebuilds a DSL sub-tree from its pattern name, parameters, and preserved children.
-    Handles both SINGLETON and PAIR patterns.
+    """Rebuilds a DSL node from a pattern name, parameters, and children.
+
+    Handles both singleton and parent-child pair patterns.
+
+    Args:
+        pattern_name (str): Name of the pattern (e.g., 'Scale', 'Translate(Box)').
+        params (list): Parameters for the node.
+        children (list): Child nodes.
+
+    Returns:
+        DSL node: Reconstructed DSL node.
+
+    Raises:
+        ValueError: If a pattern name is unrecognized or children are missing.
     """
     debug_info(
-        f"[INSTANTIATE] Pattern: '{pattern_name}' | params={params[:10]}{'...' if len(params)>10 else ''} | #children={len(children)}"
+        f"[INSTANTIATE] Pattern: '{pattern_name}' | params={params[:10]}{'...' if len(params) > 10 else ''} | #children={len(children)}"
     )
 
-    # Registry defining parent parameter lengths for known PAIRS
+    # Predefined mapping for pair patterns: number of parent parameters
     param_split = {
         "Scale(Box)": 3,
         "Rotate(Scale)": 4,
@@ -124,15 +134,10 @@ def instantiate_pattern(pattern_name, params, children):
         child_node = children[0] if children else Box(-1)
 
         if NodeClass == SymRef:
-            debug_info(f"  [SINGLETON] SymRef with params length {len(params)}")
-            return SymRef(
-                child_node, plane_normal=params[:3], point_on_plane=params[3:]
-            )
+            return SymRef(child_node, plane_normal=params[:3], point_on_plane=params[3:])
         if NodeClass == SymRot:
-            debug_info(f"  [SINGLETON] SymRot with params length {len(params)}")
             return SymRot(child_node, axis=params[:3], center=params[3:], n_fold=-1)
         if NodeClass == SymTrans:
-            debug_info(f"  [SINGLETON] SymTrans with params length {len(params)}")
             return SymTrans(child_node, end_point=params, n_fold=-1)
 
         return NodeClass(child_node, params)
@@ -141,10 +146,7 @@ def instantiate_pattern(pattern_name, params, children):
     elif pattern_name in param_split:
         p_len = param_split[pattern_name]
         p_params, c_params = params[:p_len], params[p_len:]
-        parent_name, child_name = (
-            pattern_name.split("(")[0],
-            pattern_name.split("(")[1][:-1],
-        )
+        parent_name, child_name = pattern_name.split("(")[0], pattern_name.split("(")[1][:-1]
         ParentClass, ChildClass = globals()[parent_name], globals()[child_name]
 
         # --- Build child node ---
@@ -152,19 +154,11 @@ def instantiate_pattern(pattern_name, params, children):
         if ChildClass == Box:
             child_node = Box(-1)
         elif ChildClass == Union:
-            if len(children) >= 2:
-                child_node = Union(children[0], children[1])
-            else:
-                debug_error(f"  [PAIR] Unexpected children for Union in {pattern_name}")
-                child_node = Box(-1)
+            child_node = Union(children[0], children[1]) if len(children) >= 2 else Box(-1)
         elif ChildClass == SymRef:
-            child_node = SymRef(
-                grandchild_node, plane_normal=c_params[:3], point_on_plane=c_params[3:]
-            )
+            child_node = SymRef(grandchild_node, plane_normal=c_params[:3], point_on_plane=c_params[3:])
         elif ChildClass == SymRot:
-            child_node = SymRot(
-                grandchild_node, axis=c_params[:3], center=c_params[3:], n_fold=-1
-            )
+            child_node = SymRot(grandchild_node, axis=c_params[:3], center=c_params[3:], n_fold=-1)
         elif ChildClass == SymTrans:
             child_node = SymTrans(grandchild_node, end_point=c_params, n_fold=-1)
         else:
@@ -172,17 +166,9 @@ def instantiate_pattern(pattern_name, params, children):
 
         # --- Build parent node ---
         if ParentClass == Union:
-            if len(children) >= 2:
-                return Union(child_node, children[1])
-            else:
-                debug_error(
-                    f"  [PAIR] Union parent with missing second child in {pattern_name}"
-                )
-                return Box(-1)
+            return Union(child_node, children[1]) if len(children) >= 2 else Box(-1)
         elif ParentClass == SymRef:
-            return SymRef(
-                child_node, plane_normal=p_params[:3], point_on_plane=p_params[3:]
-            )
+            return SymRef(child_node, plane_normal=p_params[:3], point_on_plane=p_params[3:])
         elif ParentClass == SymRot:
             return SymRot(child_node, axis=p_params[:3], center=p_params[3:], n_fold=-1)
         elif ParentClass == SymTrans:
@@ -195,15 +181,24 @@ def instantiate_pattern(pattern_name, params, children):
 
 
 class Abstraction:
+    """Represents a compressed DSL pattern using an autoencoder."""
+
     def __init__(self, pattern_name, compressed_params, model, children=None):
-        self.pattern_name, self.compressed_params, self.model = (
-            pattern_name,
-            compressed_params,
-            model,
-        )
+        """Initializes an abstraction node.
+
+        Args:
+            pattern_name (str): Name of the pattern.
+            compressed_params (list): Compressed latent representation.
+            model (Autoencoder): Trained autoencoder model for reconstruction.
+            children (list, optional): Child nodes. Defaults to None.
+        """
+        self.pattern_name = pattern_name
+        self.compressed_params = compressed_params
+        self.model = model
         self.children = children if children is not None else []
 
     def __str__(self):
+        """Returns a string representation of the abstraction."""
         header = f"Abs({self.pattern_name}, dim={len(self.compressed_params)})"
         if not self.children:
             return header
@@ -214,7 +209,11 @@ class Abstraction:
     __repr__ = __str__
 
     def expand(self):
-        """Reconstructs the full DSL node from compressed parameters."""
+        """Reconstructs the full DSL node from compressed parameters.
+
+        Returns:
+            DSL node: Expanded DSL node.
+        """
         debug_info(f"Expanding abstraction: {self}")
         if not self.compressed_params:
             debug_error("No compressed params found. Returning Box(-1).")
@@ -222,59 +221,67 @@ class Abstraction:
 
         self.model.eval()
         with torch.no_grad():
-            params_tensor = t(
-                torch.tensor(self.compressed_params, dtype=torch.float32)
-            ).unsqueeze(0)
-            debug_info(f"Compressed params tensor shape: {tuple(params_tensor.shape)}")
+            params_tensor = t(torch.tensor(self.compressed_params, dtype=torch.float32)).unsqueeze(0)
             reconstructed_params = self.model.decoder(params_tensor).squeeze().tolist()
             debug_success(f"Reconstructed params: {reconstructed_params}")
 
-        rebuilt_node = instantiate_pattern(
-            self.pattern_name, reconstructed_params, self.children
-        )
+        rebuilt_node = instantiate_pattern(self.pattern_name, reconstructed_params, self.children)
         debug_success(f"Successfully rebuilt node: {rebuilt_node}")
         return rebuilt_node.expand()
 
 
 def prepare_autoencoder_train_data(parameters, mask, batch_size=BATCH_SIZE):
-    """Creates a DataLoader from parameters and a boolean mask."""
-    debug_info(
-        f"Preparing DataLoader: batch_size={batch_size}, mask sum={mask.sum().item()}"
-    )
+    """Creates a DataLoader from parameters and a boolean mask.
+
+    Args:
+        parameters (list): Parameter vectors.
+        mask (torch.Tensor): Boolean mask selecting examples.
+        batch_size (int, optional): Batch size. Defaults to BATCH_SIZE.
+
+    Returns:
+        DataLoader: PyTorch DataLoader for training.
+    """
     tensor = t(torch.tensor(parameters, dtype=torch.float32))
     if mask.shape[0] != tensor.shape[0]:
-        debug_error(
-            f"Mask size {mask.shape[0]} does not match data size {tensor.shape[0]}"
-        )
         raise ValueError(f"Mask size {mask.shape[0]} != data size {tensor.shape[0]}")
-    dataloader = DataLoader(
-        TensorDataset(tensor[mask]), batch_size=batch_size, shuffle=True
-    )
-    debug_success("DataLoader prepared successfully.")
+    dataloader = DataLoader(TensorDataset(tensor[mask]), batch_size=batch_size, shuffle=True)
     return dataloader
 
 
 def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD):
-    """Checks if parameters are well reconstructed by the autoencoder."""
+    """Determines if a parameter set is well reconstructed by an autoencoder.
+
+    Args:
+        model (Autoencoder): Trained autoencoder.
+        parameters_tensor (torch.Tensor): Input parameter vectors.
+        error_threshold (float, optional): Maximum reconstruction error allowed.
+
+    Returns:
+        torch.BoolTensor: Boolean mask of well-explained examples.
+    """
     model.eval()
     with torch.no_grad():
         _, reconstructions = model(parameters_tensor)
         error, _ = torch.max(torch.abs(reconstructions - parameters_tensor), dim=-1)
-    debug_info(f"Max reconstruction error per sample: {error}")
     well_explained = error < error_threshold
-    debug_info(
-        f"Number of well-explained examples: {well_explained.sum().item()}/{len(well_explained)}"
-    )
     return well_explained
 
 
 def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE):
-    """Trains an autoencoder and plots and saves its loss curve."""
-    debug_info(f"Training autoencoder for {epochs} epochs, learning rate={lr}")
+    """Trains an autoencoder and plots training loss.
+
+    Args:
+        model (Autoencoder): Model to train.
+        dataloader (DataLoader): Training data.
+        model_name (str): Name for plotting/saving the loss chart.
+        epochs (int, optional): Number of epochs.
+        lr (float, optional): Learning rate.
+
+    Returns:
+        Autoencoder: Trained autoencoder.
+    """
     optimizer = AdamW(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
-    model.train()
-    
     epoch_losses = []
 
     for epoch in range(epochs):
@@ -287,17 +294,10 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * x.size(0)
-        
         avg_epoch_loss = epoch_loss / len(dataloader.dataset)
         epoch_losses.append(avg_epoch_loss)
-        debug_info(
-            f"Epoch {epoch+1}/{epochs} - Average loss: {avg_epoch_loss:.6f}"
-        )
 
-    debug_success("Autoencoder training complete.")
-    
-    # --- PLOTTING LOGIC ---
-    debug_info(f"Plotting training loss for model: {model_name}")
+    # Plotting
     fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
     ax.plot(range(1, epochs + 1), epoch_losses, marker='o', linestyle='-', label='Training Loss')
     ax.set_title(f"Training Loss for Model: {model_name}")
@@ -305,147 +305,102 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
     ax.set_ylabel("Average MSE Loss")
     ax.grid(True, linestyle='--', alpha=0.6)
     ax.legend()
-    # Ensure integer ticks for epochs, especially for smaller epoch counts
     if epochs <= 25:
         ax.set_xticks(range(1, epochs + 1))
     fig.tight_layout()
 
-    # --- SAVING THE PLOT ---
     try:
-        # Create a 'saved' directory relative to this file's location
         save_dir = Path(__file__).parent / "saved"
         save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Sanitize the model name to create a valid filename
         safe_filename = model_name.replace("(", "_").replace(")", "").replace("/", "_") + "_loss_chart.png"
-        save_path = save_dir / safe_filename
-        
-        fig.savefig(save_path)
-        debug_success(f"Loss chart saved to: {save_path}")
+        fig.savefig(save_dir / safe_filename)
     except Exception as e:
         debug_error(f"Failed to save loss chart: {e}")
 
-    plt.show() # Display the plot in interactive environments
-    plt.close(fig) # Close the figure to free up memory
+    plt.show()
+    plt.close(fig)
 
     return model
 
 
-def find_abstractions(
-    structures,
-    structure_type="PATTERNS",
-    min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
-    retrain_iterations=RETRAIN_ITERATIONS,
-    error_threshold=ERROR_THRESHOLD,
-    epochs=EPOCHS,
-):
-    """Trains autoencoders for each structure type and returns models."""
+def find_abstractions(structures, structure_type="PATTERNS", min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
+                      retrain_iterations=RETRAIN_ITERATIONS, error_threshold=ERROR_THRESHOLD, epochs=EPOCHS):
+    """Trains autoencoders for each structure type and returns models.
+
+    Args:
+        structures (dict): Mapping pattern names to parameter lists.
+        structure_type (str, optional): Type description for logging.
+        min_examples (int, optional): Minimum examples to train a model.
+        retrain_iterations (int, optional): Number of retraining passes.
+        error_threshold (float, optional): Maximum reconstruction error allowed.
+        epochs (int, optional): Training epochs.
+
+    Returns:
+        dict: Trained models keyed by pattern name.
+    """
     trained_models = {}
-    sorted_structures = sorted(
-        structures.items(), key=lambda item: len(item[1]), reverse=True
-    )
-
-    debug_info(
-        f"Finding abstractions for {len(sorted_structures)} structures of type {structure_type}"
-    )
-
+    sorted_structures = sorted(structures.items(), key=lambda item: len(item[1]), reverse=True)
     for name, parameters in sorted_structures:
         if len(parameters) < min_examples:
-            debug_info(f"Skipping {name} (only {len(parameters)} examples)")
             continue
-
         num_params = len(parameters[0])
         if num_params <= 1:
-            debug_info(f"Skipping {name} (too few params: {num_params})")
             continue
-
-        debug_success(
-            f"Training model for {name} with {len(parameters)} samples, {num_params} params"
-        )
         params_tensor = t(torch.tensor(parameters, dtype=torch.float32))
         mask = torch.ones(len(parameters), dtype=torch.bool)
-
         for iteration in range(retrain_iterations):
             if not mask.any():
-                debug_info(f"All {name} examples filtered out at iteration {iteration}")
                 break
-
-            debug_info(f"Iteration {iteration+1}/{retrain_iterations} for {name}")
             dataloader = prepare_autoencoder_train_data(parameters, mask=mask)
             model = Autoencoder(num_params, max(1, num_params - 1)).to(DEVICE)
-            
-            # --- FIX: Pass the 'name' of the pattern as the model_name for plotting ---
             model = train_autoencoder(model, dataloader, model_name=name, epochs=epochs)
-
             mask = is_well_explained(model, params_tensor, error_threshold)
-
         trained_models[name] = model
-        debug_success(
-            f"Model training finished for {name}. Total well-explained examples: {mask.sum().item()}/{len(parameters)}"
-        )
-
-    debug_success(f"Finished training {len(trained_models)} {structure_type}")
     return trained_models
 
 
-def integrate_abstractions(
-    node, singleton_models, pair_models, error_threshold=ERROR_THRESHOLD, depth=0
-):
-    """Recursively traverses a DSL tree and replaces well-explained patterns with Abstraction nodes."""
-    indent = "  " * depth
+def integrate_abstractions(node, singleton_models, pair_models, error_threshold=ERROR_THRESHOLD, depth=0):
+    """Recursively abstracts a DSL tree with trained models.
 
+    Args:
+        node (DSL node): Root of the DSL tree.
+        singleton_models (dict): Trained singleton autoencoders.
+        pair_models (dict): Trained pair autoencoders.
+        error_threshold (float, optional): Maximum reconstruction error to accept abstraction.
+        depth (int, optional): Recursion depth for logging purposes.
+
+    Returns:
+        DSL node: Tree with abstraction nodes applied.
+    """
+    indent = "  " * depth
     if isinstance(node, Abstraction):
-        debug_info(
-            f"{indent}[Abstraction] Node already abstracted: {node.pattern_name}"
-        )
         return node
 
-    # 1. Recurse to children first
     _, (_, children) = node.serialize()
     rebuilt_children = [
-        (
-            integrate_abstractions(
-                c, singleton_models, pair_models, error_threshold, depth + 1
-            )
-            if hasattr(c, "serialize")
-            else c
-        )
+        integrate_abstractions(c, singleton_models, pair_models, error_threshold, depth + 1)
+        if hasattr(c, "serialize") else c
         for c in children
     ]
 
-    # 2. Rebuild current node with potentially abstracted children
     try:
         if isinstance(node, Union):
             current_node = Union(rebuilt_children[0], rebuilt_children[1])
         elif isinstance(node, SymRef):
-            current_node = SymRef(
-                rebuilt_children[0],
-                plane_normal=node.plane,
-                point_on_plane=node.point_on_plane,
-            )
+            current_node = SymRef(rebuilt_children[0], plane_normal=node.plane, point_on_plane=node.point_on_plane)
         elif isinstance(node, SymRot):
-            current_node = SymRot(
-                rebuilt_children[0], axis=node.axis, center=node.center, n_fold=node.n
-            )
+            current_node = SymRot(rebuilt_children[0], axis=node.axis, center=node.center, n_fold=node.n)
         elif isinstance(node, SymTrans):
-            current_node = SymTrans(
-                rebuilt_children[0], end_point=node.end_point, n_fold=node.n
-            )
+            current_node = SymTrans(rebuilt_children[0], end_point=node.end_point, n_fold=node.n)
         elif hasattr(node, "child"):
             kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
             current_node = type(node)(rebuilt_children[0], **kwargs)
         else:
             current_node = type(node)(*rebuilt_children)
-        debug_info(
-            f"{indent}[Rebuilt] {type(current_node).__name__} with {len(rebuilt_children)} children"
-        )
     except Exception as e:
-        debug_error(
-            f"{indent}[Rebuild FAILED] {type(node).__name__} at depth {depth}: {e}"
-        )
         return node
 
-    # 3. Try to abstract the current node as part of a PAIR
+    # Try PAIR abstraction
     child_nodes = [c for c in rebuilt_children if hasattr(c, "serialize")]
     if len(child_nodes) == 1:
         child_node = child_nodes[0]
@@ -457,42 +412,23 @@ def integrate_abstractions(
                     current_node.serialize()[1],
                     child_node.serialize()[1],
                 )
-                if p_params + c_params:
-                    combined = t(
-                        torch.tensor(p_params + c_params, dtype=torch.float32)
-                    ).unsqueeze(0)
-                    _, reconstruction = model(combined)
-                    error = torch.max(torch.abs(reconstruction - combined)).item()
-                    debug_info(f"{indent}[PAIR CHECK] {pair_sig}, error={error:.4f}")
-                    if error < error_threshold:
-                        encoding, _ = model(combined)
-                        grandchildren = [
-                            c for c in c_children if hasattr(c, "serialize")
-                        ]
-                        debug_success(f"{indent}[PAIR ABSTRACTION CREATED] {pair_sig}")
-                        return Abstraction(
-                            pair_sig,
-                            encoding.squeeze().tolist(),
-                            model,
-                            children=grandchildren,
-                        )
+                combined = t(torch.tensor(p_params + c_params, dtype=torch.float32)).unsqueeze(0)
+                _, reconstruction = model(combined)
+                error = torch.max(torch.abs(reconstruction - combined)).item()
+                if error < error_threshold:
+                    encoding, _ = model(combined)
+                    grandchildren = [c for c in c_children if hasattr(c, "serialize")]
+                    return Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
 
-    # 4. Try to abstract the current node as a SINGLETON
+    # Try SINGLETON abstraction
     name = type(current_node).__name__
     if name in singleton_models:
         model, (p_params, _) = singleton_models[name], current_node.serialize()[1]
-        if p_params:
-            params_tensor = t(torch.tensor(p_params, dtype=torch.float32)).unsqueeze(0)
-            _, reconstruction = model(params_tensor)
-            error = torch.max(torch.abs(reconstruction - params_tensor)).item()
-            debug_info(f"{indent}[SINGLETON CHECK] {name}, error={error:.4f}")
-            if error < error_threshold:
-                encoding, _ = model(params_tensor)
-                debug_success(f"{indent}[SINGLETON ABSTRACTION CREATED] {name}")
-                return Abstraction(
-                    name, encoding.squeeze().tolist(), model, children=child_nodes
-                )
+        params_tensor = t(torch.tensor(p_params, dtype=torch.float32)).unsqueeze(0)
+        _, reconstruction = model(params_tensor)
+        error = torch.max(torch.abs(reconstruction - params_tensor)).item()
+        if error < error_threshold:
+            encoding, _ = model(params_tensor)
+            return Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
 
-    # 5. No abstraction was applicable, return the rebuilt node
-    debug_info(f"{indent}[RETURN NODE] {type(current_node).__name__}")
     return current_node

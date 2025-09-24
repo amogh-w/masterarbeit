@@ -1,7 +1,8 @@
 """
 plot_utils.py
 
-Utilities for expanding DSL trees and visualizing them as 3D meshes using k3d, with robust debug logging.
+Utilities for expanding DSL trees and visualizing them as 3D meshes using k3d,
+with robust debug logging.
 """
 
 import k3d
@@ -20,6 +21,15 @@ LABEL_COLORS = {
 
 
 def expand_dsl_tree(node):
+    """Expands a DSL tree node into its final geometry.
+
+    Args:
+        node: A DSL tree node object that must implement an ``expand()`` method.
+
+    Returns:
+        list: A list of box dictionaries containing geometry and label
+        information. Returns an empty list if expansion fails.
+    """
     try:
         return node.expand()
     except Exception as e:
@@ -28,6 +38,24 @@ def expand_dsl_tree(node):
 
 
 def plot_dsl_with_k3d(dsl_root_node):
+    """Expands and visualizes a DSL tree as a 3D mesh using k3d.
+
+    Args:
+        dsl_root_node: The root node of the DSL tree to be expanded and plotted.
+            The expansion must yield a list of boxes where each box is a dict
+            with the following keys:
+                - ``center`` (np.ndarray): The (x, y, z) coordinates of the box center.
+                - ``lengths`` (list or np.ndarray): The lengths along each axis.
+                - ``quaternion`` (list or np.ndarray): Quaternion representing orientation.
+                - ``label_id`` (int, optional): Part label ID, defaults to -1.
+
+    Side Effects:
+        Displays a 3D interactive mesh visualization in the notebook or viewer.
+
+    Raises:
+        Exception: Any errors during plotting are caught and logged using
+        ``debug_error``.
+    """
     debug_info("Expanding DSL tree for visualization...")
     final_boxes = expand_dsl_tree(dsl_root_node)
 

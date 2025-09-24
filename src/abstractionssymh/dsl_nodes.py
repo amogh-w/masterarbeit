@@ -1,8 +1,9 @@
 """
 dsl_nodes.py
 
-Definitions of DSL node types for 3D shape construction, including Box, Transformations (Scale, Rotate, Translate),
-Unions, and Symmetry operations (reflection, rotation, translation). Provides expand() and serialize() methods for all nodes.
+Definitions of DSL node types for 3D shape construction, including Box, Transformations
+(Scale, Rotate, Translate), Unions, and Symmetry operations (reflection, rotation, translation).
+Provides expand() and serialize() methods for all nodes.
 """
 
 import textwrap
@@ -12,6 +13,15 @@ from scipy.spatial.transform import Rotation
 
 
 def _format_vec(vec, precision=3):
+    """Formats a vector or number as a string with the given precision.
+
+    Args:
+        vec: List, np.ndarray, or single numeric value.
+        precision: Number of decimal places.
+
+    Returns:
+        Formatted string representation of the vector or number.
+    """
     if isinstance(vec, (list, np.ndarray)):
         return f"[{', '.join(f'{x:.{precision}f}' for x in vec)}]"
     else:
@@ -19,13 +29,21 @@ def _format_vec(vec, precision=3):
 
 
 class Box:
-    def __init__(self, label: int):
+    """Represents a unit cube with a label."""
+
+    def __init__(self, label):
+        """Initializes a Box.
+
+        Args:
+            label: Integer label for the box.
+        """
         self.label = label
 
     def __str__(self):
         return f"Box(label={self.label})"
 
     def expand(self):
+        """Returns a single box geometry as a dict."""
         return [
             {
                 "center": np.array([0.0, 0.0, 0.0]),
@@ -36,11 +54,20 @@ class Box:
         ]
 
     def serialize(self):
+        """Returns a tuple of (class, parameters) for DSL processing."""
         return (Box, ([], [self.label]))
 
 
 class Scale:
+    """Applies scaling to a child node."""
+
     def __init__(self, child, lengths):
+        """Initializes a Scale node.
+
+        Args:
+            child: DSL node to scale.
+            lengths: Scaling factors for x, y, z axes.
+        """
         self.child = child
         self.lengths = np.array(lengths)
 
@@ -49,6 +76,7 @@ class Scale:
         return f"Scale(lengths={_format_vec(self.lengths)})\n{child_str}"
 
     def expand(self):
+        """Scales child boxes and returns the transformed boxes."""
         child_boxes = self.child.expand()
         for box in child_boxes:
             box["lengths"] *= self.lengths
@@ -60,6 +88,8 @@ class Scale:
 
 
 class Rotate:
+    """Applies rotation to a child node using a quaternion."""
+
     def __init__(self, child, quaternion):
         self.child = child
         self.quaternion = np.array(quaternion)
@@ -69,6 +99,7 @@ class Rotate:
         return f"Rotate(quat={_format_vec(self.quaternion, precision=4)})\n{child_str}"
 
     def expand(self):
+        """Rotates child boxes and returns the transformed boxes."""
         child_boxes = self.child.expand()
         op_rotation = Rotation.from_quat(self.quaternion)
         for box in child_boxes:
@@ -82,6 +113,8 @@ class Rotate:
 
 
 class Translate:
+    """Applies translation to a child node."""
+
     def __init__(self, child, center):
         self.child = child
         self.center = np.array(center)
@@ -91,6 +124,7 @@ class Translate:
         return f"Translate(center={_format_vec(self.center)})\n{child_str}"
 
     def expand(self):
+        """Translates child boxes and returns the transformed boxes."""
         child_boxes = self.child.expand()
         for box in child_boxes:
             box["center"] += self.center
@@ -101,6 +135,8 @@ class Translate:
 
 
 class Union:
+    """Represents the union of two child nodes."""
+
     def __init__(self, left, right):
         self.left = left
         self.right = right
@@ -111,6 +147,7 @@ class Union:
         return f"Union(\n{left_str},\n{right_str}\n)"
 
     def expand(self):
+        """Returns the combined boxes of both children."""
         return self.left.expand() + self.right.expand()
 
     def serialize(self):
@@ -118,11 +155,14 @@ class Union:
 
 
 class Symmetry:
+    """Base class for symmetry operations."""
     def __init__(self, child):
         self.child = child
 
 
 class SymRef(Symmetry):
+    """Reflects a child node across a plane."""
+
     def __init__(self, child, plane_normal, point_on_plane):
         super().__init__(child)
         self.plane = np.array(plane_normal)
@@ -138,6 +178,7 @@ class SymRef(Symmetry):
         return f"{info}(\n{child_str}\n)"
 
     def expand(self):
+        """Expands child boxes and adds reflected boxes across the plane."""
         child_boxes = self.child.expand()
         generated_boxes = []
         plane_normal = self.plane / (np.linalg.norm(self.plane) + 1e-8)
@@ -164,7 +205,9 @@ class SymRef(Symmetry):
 
 
 class SymRot(Symmetry):
-    def __init__(self, child, axis, center, n_fold: int):
+    """Applies n-fold rotational symmetry around an axis and center."""
+
+    def __init__(self, child, axis, center, n_fold):
         super().__init__(child)
         self.axis = np.array(axis)
         self.center = np.array(center)
@@ -181,6 +224,7 @@ class SymRot(Symmetry):
         return f"{info}(\n{child_str}\n)"
 
     def expand(self):
+        """Expands child boxes and generates rotated copies."""
         child_boxes = self.child.expand()
         generated_boxes = []
         axis = self.axis / (np.linalg.norm(self.axis) + 1e-8)
@@ -191,9 +235,7 @@ class SymRot(Symmetry):
             for box in child_boxes:
                 rotated_box = copy.deepcopy(box)
                 vec_from_center = box["center"] - self.center
-                rotated_box["center"] = self.center + symmetry_rot.apply(
-                    vec_from_center
-                )
+                rotated_box["center"] = self.center + symmetry_rot.apply(vec_from_center)
                 original_rot = Rotation.from_quat(box["quaternion"])
                 rotated_box["quaternion"] = (symmetry_rot * original_rot).as_quat()
                 generated_boxes.append(rotated_box)
@@ -206,7 +248,9 @@ class SymRot(Symmetry):
 
 
 class SymTrans(Symmetry):
-    def __init__(self, child, end_point, n_fold: int):
+    """Applies n-fold translational symmetry along a vector."""
+
+    def __init__(self, child, end_point, n_fold):
         super().__init__(child)
         self.end_point = np.array(end_point)
         self.n = n_fold
@@ -221,6 +265,7 @@ class SymTrans(Symmetry):
         return f"{info}(\n{child_str}\n)"
 
     def expand(self):
+        """Expands child boxes and generates translated copies."""
         child_boxes = self.child.expand()
         if not child_boxes:
             return []

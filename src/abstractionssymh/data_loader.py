@@ -26,13 +26,26 @@ LABEL_NAMES = {0: "Backrest", 1: "Seat", 2: "Leg", 3: "Armrest"}
 
 
 class Tree(object):
+    """Represents a hierarchical tree structure for 3D shape composition."""
+
     class NodeType(Enum):
+        """Node types in the tree."""
         BOX, ADJ, SYM = 0, 1, 2
 
     class Node(object):
-        def __init__(
-            self, box=None, left=None, right=None, node_type=None, sym=None, label=None
-        ):
+        """A single node in the Tree."""
+
+        def __init__(self, box=None, left=None, right=None, node_type=None, sym=None, label=None):
+            """Initializes a Node.
+
+            Args:
+                box: Box tensor for leaf nodes.
+                left: Left child node.
+                right: Right child node.
+                node_type: Type of node (BOX, ADJ, SYM).
+                sym: Symmetry parameters for SYM nodes.
+                label: Label of the box.
+            """
             self.box, self.sym, self.left, self.right, self.node_type, self.label = (
                 box,
                 sym,
@@ -43,15 +56,19 @@ class Tree(object):
             )
 
         def is_leaf(self):
+            """Returns True if node is a leaf (BOX)."""
             return self.node_type == Tree.NodeType.BOX
 
         def is_adj(self):
+            """Returns True if node is an adjacency (ADJ)."""
             return self.node_type == Tree.NodeType.ADJ
 
         def is_sym(self):
+            """Returns True if node is a symmetry (SYM)."""
             return self.node_type == Tree.NodeType.SYM
 
     def __init__(self, boxes, ops, syms, labels):
+        """Constructs a Tree from box, op, sym, and label tensors."""
         box_list = [b for b in torch.split(boxes, 1, 0)]
         sym_param = [s for s in torch.split(syms, 1, 0)]
         label_list = [l for l in labels[0]]
@@ -59,6 +76,7 @@ class Tree(object):
         sym_param.reverse()
         label_list.reverse()
         queue = []
+
         for op_id in range(ops.size()[1]):
             if ops[0, op_id] == self.NodeType.BOX.value:
                 queue.append(
@@ -85,7 +103,14 @@ class Tree(object):
 
 @dataclass
 class ShapeData:
+    """Holds all shape-related data, including boxes, labels, ops, syms, and the tree."""
+
     def __init__(self, row):
+        """Loads shape data from MATLAB .mat files.
+
+        Args:
+            row: An object containing paths for boxes, labels, ops, and syms.
+        """
         self.boxes = scipy.io.loadmat(row.boxes)["box"]
         self.labels = scipy.io.loadmat(row.labels)["label"]
         self.ops = scipy.io.loadmat(row.ops)["op"]
@@ -95,6 +120,7 @@ class ShapeData:
         self.tree = None
 
     def construct_tree(self):
+        """Converts loaded data into a Tree object."""
         boxes_t = torch.tensor(self.boxes, dtype=torch.float).t()
         ops_t = torch.tensor(self.ops, dtype=torch.int)
         syms_t = torch.tensor(self.syms, dtype=torch.float).t()
@@ -104,6 +130,14 @@ class ShapeData:
 
 
 def tree_to_dsl(node):
+    """Recursively converts a Tree node into a corresponding DSL object.
+
+    Args:
+        node: Tree.Node object.
+
+    Returns:
+        DSL node representing the same structure.
+    """
     if node.is_leaf():
         box_vec = node.box.squeeze()
         center = box_vec[0:3].tolist()
@@ -163,6 +197,14 @@ def tree_to_dsl(node):
 
 
 def dsl_to_dict(node):
+    """Converts a DSL node into a JSON-serializable dictionary.
+
+    Args:
+        node: DSL node object.
+
+    Returns:
+        Dictionary representation of the node.
+    """
     if isinstance(node, Box):
         return {"type": "Box", "label": node.label}
     elif isinstance(node, Translate):
@@ -215,6 +257,18 @@ def dsl_to_dict(node):
 
 
 def dict_to_dsl(node_dict):
+    """Converts a JSON-like dictionary back into a DSL node.
+
+    Args:
+        node_dict: Dictionary representation of a DSL node.
+
+    Returns:
+        Corresponding DSL node object.
+
+    Raises:
+        TypeError: If the input is not a dictionary.
+        ValueError: If the node type is unknown.
+    """
     if not isinstance(node_dict, dict):
         raise TypeError("Input must be a dictionary.")
     node_type = node_dict.get("type")
@@ -260,6 +314,14 @@ def dict_to_dsl(node_dict):
 
 
 def parse_json_to_dsl(json_string):
+    """Parses a JSON string into a DSL node.
+
+    Args:
+        json_string: JSON string representing a DSL structure.
+
+    Returns:
+        DSL node object.
+    """
     import json
 
     return dict_to_dsl(json.loads(json_string))
