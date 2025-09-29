@@ -5,6 +5,8 @@ Utilities for expanding DSL trees and visualizing them as 3D meshes using k3d,
 with robust debug logging.
 """
 
+import base64
+import io
 from pathlib import Path
 import k3d
 import numpy as np
@@ -217,3 +219,68 @@ def plot_dsl_with_matplotlib(
         debug_success("3D plot displayed successfully.")
     
     plt.close(fig)
+
+def plot_dsl_with_matplotlib_dash(dsl_root_node, axis_limits=(-1, 1)):
+    """
+    Generates a Matplotlib 3D plot from a DSL object and returns a base64 PNG
+    string ready for Dash display in html.Img.
+    """
+
+    # Expand DSL tree to get final boxes
+    final_boxes = expand_dsl_tree(dsl_root_node)
+    if not final_boxes:
+        return None
+
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    for box in final_boxes:
+        center = np.array(box["center"], dtype=float)
+        lengths = np.asarray(box["lengths"], dtype=float).ravel()
+        quaternion = box["quaternion"]
+        label_id = box.get("label_id", -1)
+
+        rotation_matrix = Rotation.from_quat(quaternion).as_matrix()
+        d1, d2, d3 = [col * length / 2 for col, length in zip(rotation_matrix.T, lengths)]
+
+        corners = np.array([
+            center - d1 - d2 - d3,
+            center + d1 - d2 - d3,
+            center + d1 + d2 - d3,
+            center - d1 + d2 - d3,
+            center - d1 - d2 + d3,
+            center + d1 - d2 + d3,
+            center + d1 + d2 + d3,
+            center - d1 + d2 + d3,
+        ])
+
+        faces_indices = [
+            [corners[0], corners[1], corners[2], corners[3]],  # Bottom
+            [corners[4], corners[5], corners[6], corners[7]],  # Top
+            [corners[0], corners[1], corners[5], corners[4]],  # Front
+            [corners[2], corners[3], corners[7], corners[6]],  # Back
+            [corners[0], corners[3], corners[7], corners[4]],  # Left
+            [corners[1], corners[2], corners[6], corners[5]],  # Right
+        ]
+
+        hex_color = LABEL_COLORS.get(label_id, LABEL_COLORS[-1])
+        color = hex_to_rgb_normalized(hex_color)
+        collection = Poly3DCollection(faces_indices, facecolors=color, edgecolors="k", linewidths=0.3, alpha=0.8)
+        ax.add_collection3d(collection)
+
+    ax.set_xlim(axis_limits)
+    ax.set_ylim(axis_limits)
+    ax.set_zlim(axis_limits)
+    ax.set_box_aspect([1, 1, 1])
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.tight_layout()
+
+    # Save to in-memory buffer and encode as base64
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    return f"data:image/png;base64,{img_base64}"

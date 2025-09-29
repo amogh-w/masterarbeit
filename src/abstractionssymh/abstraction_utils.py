@@ -1,3 +1,4 @@
+import re
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -5,6 +6,8 @@ from torch.optim import AdamW
 import textwrap
 import matplotlib.pyplot as plt
 from pathlib import Path
+# from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from abstractionssymh.dsl_nodes import (
     Box,
@@ -269,8 +272,24 @@ def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD)
     return well_explained
 
 
+# --- Helper to create safe filenames (same as models) ---
+def make_safe_filename(name: str, suffix: str = "") -> str:
+    safe = re.sub(r'[^\w\-]+', '_', name)
+    safe = re.sub(r'_+', '_', safe).strip('_')
+    if suffix:
+        return f"{safe.lower()}_{suffix}"
+    return safe.lower()
+
+# from tqdm import tqdm
+import matplotlib.pyplot as plt
+from pathlib import Path
+import torch
+from torch.optim import AdamW
+import torch.nn as nn
+
 def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE):
-    """Trains an autoencoder and plots training loss.
+    """
+    Trains an autoencoder with a single tqdm progress bar and plots training loss.
 
     Args:
         model (Autoencoder): Model to train.
@@ -286,20 +305,37 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
     loss_fn = nn.MSELoss()
     epoch_losses = []
 
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        for batch in dataloader:
-            x = batch[0].to(DEVICE)
-            optimizer.zero_grad()
-            _, x_rec = model(x)
-            loss = loss_fn(x_rec, x)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * x.size(0)
-        avg_epoch_loss = epoch_loss / len(dataloader.dataset)
-        epoch_losses.append(avg_epoch_loss)
+    total_batches = epochs * len(dataloader)
+    global_batch = 0
 
-    # Plotting
+    # Single outer tqdm
+    with tqdm(total=total_batches, desc=f"Training {model_name}", unit="batch") as pbar:
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            for batch in dataloader:
+                x = batch[0].to(DEVICE)
+                optimizer.zero_grad()
+                _, x_rec = model(x)
+                loss = loss_fn(x_rec, x)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item() * x.size(0)
+                global_batch += 1
+
+                avg_batch_loss = epoch_loss / ((global_batch - 1) % len(dataloader) + 1)
+                pbar.set_postfix({
+                    "epoch": f"{epoch+1}/{epochs}",
+                    "batch_loss": f"{loss.item():.6f}",
+                    "avg_epoch_loss": f"{avg_batch_loss:.6f}"
+                })
+                pbar.update(1)
+
+            avg_epoch_loss = epoch_loss / len(dataloader.dataset)
+            epoch_losses.append(avg_epoch_loss)
+            # tqdm.write(f"Epoch {epoch+1}/{epochs} - Avg Loss: {avg_epoch_loss:.6f}")
+
+    # Plot epoch losses
     fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
     ax.plot(range(1, epochs + 1), epoch_losses, marker='o', linestyle='-', label='Training Loss')
     ax.set_title(f"Training Loss for Model: {model_name}")
@@ -311,10 +347,11 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
         ax.set_xticks(range(1, epochs + 1))
     fig.tight_layout()
 
+    # Save loss chart using safe filename logic
     try:
-        save_dir = Path(__file__).parent / "saved"
+        save_dir = Path(__file__).parent / "saved" / "models"
         save_dir.mkdir(parents=True, exist_ok=True)
-        safe_filename = model_name.replace("(", "_").replace(")", "").replace("/", "_") + "_loss_chart.png"
+        safe_filename = make_safe_filename(model_name, suffix="loss_chart") + ".png"
         fig.savefig(save_dir / safe_filename)
     except Exception as e:
         debug_error(f"Failed to save loss chart: {e}")
