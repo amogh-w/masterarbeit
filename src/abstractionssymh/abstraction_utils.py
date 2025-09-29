@@ -200,11 +200,13 @@ class Abstraction:
     def __str__(self):
         """Returns a string representation of the abstraction."""
         header = f"Abs({self.pattern_name}, dim={len(self.compressed_params)})"
+        param_str = f"compressed_params={self.compressed_params}"
+        
         if not self.children:
-            return header
+            return f"{header}, {param_str}"
         else:
             child_strs = [textwrap.indent(str(c), "    ") for c in self.children]
-            return f"{header}(\n" + ",\n".join(child_strs) + "\n)"
+            return f"{header}, {param_str}(\n" + ",\n".join(child_strs) + "\n)"
 
     __repr__ = __str__
 
