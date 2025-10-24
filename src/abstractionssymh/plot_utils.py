@@ -7,6 +7,7 @@ with robust debug logging.
 
 import base64
 import io
+import math
 from pathlib import Path
 import k3d
 import numpy as np
@@ -284,3 +285,95 @@ def plot_dsl_with_matplotlib_dash(dsl_root_node, axis_limits=(-1, 1)):
     buf.seek(0)
     img_base64 = base64.b64encode(buf.read()).decode('utf-8')
     return f"data:image/png;base64,{img_base64}"
+
+def plot_dsl_grid(dsl_objects, names, save_path=None, grid_cols=3, figsize_per_plot=(6, 6), axis_limits=(-0.8, 0.8), grid_title=""):
+    """
+    Renders a list of DSL objects on a matplotlib grid that auto-sizes.
+
+    Args:
+        dsl_objects (list): A list of the DSL root nodes to plot.
+        names (list): A list of strings, providing a title for each plot.
+        save_path (str or Path, optional): Path to save the entire grid as a single PNG.
+        grid_cols (int): The number of columns to use for the grid layout.
+        figsize_per_plot (tuple): The (width, height) for each individual subplot.
+        axis_limits (tuple): The min and max limits for all axes.
+        grid_title (str): An overall title for the entire grid image.
+    """
+    if len(dsl_objects) != len(names):
+        debug_error("Error: The number of DSL objects must match the number of names.")
+        return
+
+    num_plots = len(dsl_objects)
+    if num_plots == 0:
+        debug_info("No DSL objects provided to plot.")
+        return
+
+    num_rows = math.ceil(num_plots / grid_cols)
+    total_figsize = (grid_cols * figsize_per_plot[0], num_rows * figsize_per_plot[1])
+
+    fig, axes = plt.subplots(num_rows, grid_cols, figsize=total_figsize,
+                             subplot_kw={'projection': '3d'}, squeeze=False)
+
+    axes_flat = axes.flatten()
+
+    for i, dsl_root_node in enumerate(dsl_objects):
+        ax = axes_flat[i]
+        title = names[i]
+        
+        final_boxes = expand_dsl_tree(dsl_root_node)
+        if not final_boxes:
+            ax.set_title(f"{title}\n(No boxes found)", fontsize=10)
+            continue
+
+        for box in final_boxes:
+            center = np.array(box.get("center", [0,0,0]), dtype=float)
+            lengths = np.asarray(box.get("lengths", [1,1,1]), dtype=float).ravel()
+            quaternion = box.get("quaternion", [0,0,0,1])
+            label_id = box.get("label_id", -1)
+
+            rotation_matrix = Rotation.from_quat(quaternion).as_matrix()
+            d1, d2, d3 = [col * length / 2 for col, length in zip(rotation_matrix.T, lengths)]
+            
+            corners = np.array([
+                center - d1 - d2 - d3, center + d1 - d2 - d3, center + d1 + d2 - d3, center - d1 + d2 - d3,
+                center - d1 - d2 + d3, center + d1 - d2 + d3, center + d1 + d2 + d3, center - d1 + d2 + d3
+            ])
+            
+            faces_indices = [
+                [corners[0], corners[1], corners[2], corners[3]], [corners[4], corners[5], corners[6], corners[7]],
+                [corners[0], corners[1], corners[5], corners[4]], [corners[2], corners[3], corners[7], corners[6]],
+                [corners[0], corners[3], corners[7], corners[4]], [corners[1], corners[2], corners[6], corners[5]]
+            ]
+            
+            hex_color = LABEL_COLORS.get(label_id, LABEL_COLORS.get(-1))
+            color = hex_to_rgb_normalized(hex_color)
+            
+            collection = Poly3DCollection(faces_indices, facecolors=color, edgecolors="k", linewidths=0.2, alpha=0.85)
+            ax.add_collection3d(collection)
+
+        ax.set_title(title, fontsize=10)
+        ax.set_xlim(axis_limits)
+        ax.set_ylim(axis_limits)
+        ax.set_zlim(axis_limits)
+        ax.set_box_aspect([1, 1, 1])
+        ax.set_xlabel("X", fontsize=8); ax.set_ylabel("Y", fontsize=8); ax.set_zlabel("Z", fontsize=8)
+
+    for i in range(num_plots, len(axes_flat)):
+        axes_flat[i].set_axis_off()
+
+    # --- NEW: Add a suptitle for the entire grid ---
+    if grid_title:
+        fig.suptitle(grid_title, fontsize=16, y=0.98) # y adjusts position
+        
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95], pad=2.0) # Adjust layout to make space for suptitle
+
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=300)
+        debug_success(f"Grid plot saved as PNG: {save_path}")
+    else:
+        plt.show()
+        debug_success("Grid plot displayed successfully.")
+    
+    plt.close(fig)
