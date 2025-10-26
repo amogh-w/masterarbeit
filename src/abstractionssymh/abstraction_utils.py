@@ -274,11 +274,19 @@ def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD)
 
 # --- Helper to create safe filenames (same as models) ---
 def make_safe_filename(name: str, suffix: str = "") -> str:
+    """
+    Creates a safe filename.
+    If suffix is provided, it's appended as an extension.
+    e.g., ("Translate(Rotate)", "pth") -> "translate_rotate.pth"
+    e.g., ("My Model", "loss_chart.png") -> "my_model.loss_chart.png"
+    """
     safe = re.sub(r'[^\w\-]+', '_', name)
-    safe = re.sub(r'_+', '_', safe).strip('_')
+    safe = re.sub(r'_+', '_', safe).strip('_').lower()
     if suffix:
-        return f"{safe.lower()}_{suffix}"
-    return safe.lower()
+        # Add a dot before the suffix to make it a file extension
+        return f"{safe}.{suffix}"
+    # Return just the safe name if no suffix
+    return safe
 
 # from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -398,31 +406,47 @@ def find_abstractions(structures, structure_type="PATTERNS", min_examples=MIN_EX
     return trained_models
 
 
-def integrate_abstractions(node, singleton_models, pair_models, error_threshold=ERROR_THRESHOLD, depth=0):
-    """Recursively abstracts a DSL tree with trained models.
-
-    Args:
-        node (DSL node): Root of the DSL tree.
-        singleton_models (dict): Trained singleton autoencoders.
-        pair_models (dict): Trained pair autoencoders.
-        error_threshold (float, optional): Maximum reconstruction error to accept abstraction.
-        depth (int, optional): Recursion depth for logging purposes.
-
-    Returns:
-        DSL node: Tree with abstraction nodes applied.
+def integrate_abstractions(node, singleton_models, pair_models, error_threshold=ERROR_THRESHOLD, depth=0, detailed_debug=False):
+    """
+    Recursively abstracts a DSL tree with trained models.
+    *** UPDATED: All detailed logging is now behind the detailed_debug flag. ***
     """
     indent = "  " * depth
-    if isinstance(node, Abstraction):
-        return node
+    
+    # --- Always log entry ---
+    node_name_repr = f"Abs({node.pattern_name})" if isinstance(node, Abstraction) else type(node).__name__
+    if detailed_debug: debug_info(f"{indent}[{depth}] Processing: {node_name_repr}")
 
+    if isinstance(node, Abstraction):
+        if detailed_debug: debug_info(f"{indent}[{depth}] Node is already an Abstraction. Recursing on its {len(node.children)} children.")
+        rebuilt_children = [
+            integrate_abstractions(c, singleton_models, pair_models, error_threshold, depth + 1, detailed_debug)
+            for c in node.children
+        ]
+        node.children = rebuilt_children
+        if detailed_debug: debug_info(f"{indent}[{depth}] Returning existing Abstraction node: {node_name_repr}")
+        return node
+    
+    if not hasattr(node, "serialize"):
+        # --- Always log critical errors ---
+        debug_error(f"{indent}[{depth}] Node {type(node).__name__} has no 'serialize' method. Returning as-is.")
+        return node
+        
+    # --- RECURSIVE STEP ---
     _, (_, children) = node.serialize()
+    valid_children = [c for c in children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
+    if detailed_debug: debug_info(f"{indent}[{depth}] Recursing on {len(valid_children)} children for {node_name_repr}...")
     rebuilt_children = [
-        integrate_abstractions(c, singleton_models, pair_models, error_threshold, depth + 1)
-        if hasattr(c, "serialize") else c
+        integrate_abstractions(c, singleton_models, pair_models, error_threshold, depth + 1, detailed_debug)
+        if hasattr(c, "serialize") or isinstance(c, Abstraction) else c
         for c in children
     ]
+    if detailed_debug: debug_info(f"{indent}[{depth}] All children for {node_name_repr} processed.")
 
+    # --- REBUILD ---
+    current_node = None
     try:
+        # Rebuild logic... (same as before)
         if isinstance(node, Union):
             current_node = Union(rebuilt_children[0], rebuilt_children[1])
         elif isinstance(node, SymRef):
@@ -435,39 +459,95 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
             kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
             current_node = type(node)(rebuilt_children[0], **kwargs)
         else:
-            current_node = type(node)(*rebuilt_children)
+            current_node = type(node)(*rebuilt_children) # Box
+        if detailed_debug: debug_info(f"{indent}[{depth}] Rebuilt {type(current_node).__name__} with new children.")
     except Exception as e:
-        return node
+        # --- Always log critical errors ---
+        debug_error(f"{indent}[{depth}] FAILED to rebuild node {node_name_repr}: {e}. Returning original node.")
+        return node # Return the original node if rebuild fails
 
-    # Try PAIR abstraction
-    child_nodes = [c for c in rebuilt_children if hasattr(c, "serialize")]
+    # --- PAIR ABSTRACTION ATTEMPT ---
+    child_nodes = [c for c in rebuilt_children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
+    
     if len(child_nodes) == 1:
         child_node = child_nodes[0]
-        if not isinstance(child_node, Abstraction):
-            pair_sig = f"{type(current_node).__name__}({type(child_node).__name__})"
+        child_name = ""
+        c_params = None
+        c_children = []
+
+        # Logic to get child info... (same as before)
+        if isinstance(child_node, Abstraction):
+            child_name = f"Abs({child_node.pattern_name})"
+            c_params = child_node.compressed_params
+            c_children = child_node.children
+        elif hasattr(child_node, "serialize"):
+            child_name = type(child_node).__name__
+            c_params, c_children = child_node.serialize()[1]
+        
+        if child_name:
+            pair_sig = f"{type(current_node).__name__}({child_name})"
+            if detailed_debug: debug_info(f"{indent}[{depth}] -> Checking for PAIR abstraction: {pair_sig}")
+            
             if pair_sig in pair_models:
-                model, (p_params, _), (c_params, c_children) = (
-                    pair_models[pair_sig],
-                    current_node.serialize()[1],
-                    child_node.serialize()[1],
-                )
-                combined = t(torch.tensor(p_params + c_params, dtype=torch.float32)).unsqueeze(0)
-                _, reconstruction = model(combined)
-                error = torch.max(torch.abs(reconstruction - combined)).item()
-                if error < error_threshold:
-                    encoding, _ = model(combined)
-                    grandchildren = [c for c in c_children if hasattr(c, "serialize")]
-                    return Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
+                if detailed_debug: debug_info(f"{indent}[{depth}]    Found model for {pair_sig}.")
+                model = pair_models[pair_sig]
+                p_params, _ = current_node.serialize()[1]
+                p_params_list = list(p_params or [])
+                c_params_list = list(c_params or [])
+                combined = t(torch.tensor(p_params_list + c_params_list, dtype=torch.float32)).unsqueeze(0)
+                
+                if combined.shape[1] == 0:
+                    if detailed_debug: debug_info(f"{indent}[{depth}]    Skipping (no params to abstract).")
+                elif combined.shape[1] != model.encoder[0].in_features:
+                    # --- Always log critical errors ---
+                    debug_error(f"{indent}[{depth}]    Shape mismatch for {pair_sig}: Model expects {model.encoder[0].in_features}, got {combined.shape[1]}")
+                else:
+                    _, reconstruction = model(combined)
+                    error = torch.max(torch.abs(reconstruction - combined)).item()
+                    if detailed_debug: debug_info(f"{indent}[{depth}]    Reconstruction error: {error:.4f} (Threshold: {error_threshold})")
+                    
+                    if error < error_threshold:
+                        # --- Log success only if detailed ---
+                        if detailed_debug: debug_success(f"{indent}[{depth}]    SUCCESS: Applying PAIR abstraction for {pair_sig}!")
+                        encoding, _ = model(combined)
+                        grandchildren = [c for c in c_children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
+                        if detailed_debug: debug_info(f"{indent}[{depth}] Returning NEW Abstraction node: {pair_sig}")
+                        return Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
+            else:
+                 if detailed_debug: debug_info(f"{indent}[{depth}]    No model found for {pair_sig}.")
 
-    # Try SINGLETON abstraction
+    # --- SINGLETON ABSTRACTION ATTEMPT ---
     name = type(current_node).__name__
+    if detailed_debug: debug_info(f"{indent}[{depth}] -> Checking for SINGLETON abstraction: {name}")
+    
     if name in singleton_models:
+        if detailed_debug: debug_info(f"{indent}[{depth}]    Found model for {name}.")
         model, (p_params, _) = singleton_models[name], current_node.serialize()[1]
+        
+        if not p_params:
+            if detailed_debug: debug_info(f"{indent}[{depth}]    Skipping (no params to abstract, e.g., Union).")
+            if detailed_debug: debug_info(f"{indent}[{depth}] Returning rebuilt node: {name}")
+            return current_node
+            
         params_tensor = t(torch.tensor(p_params, dtype=torch.float32)).unsqueeze(0)
-        _, reconstruction = model(params_tensor)
-        error = torch.max(torch.abs(reconstruction - params_tensor)).item()
-        if error < error_threshold:
-            encoding, _ = model(params_tensor)
-            return Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
+        
+        if params_tensor.shape[1] != model.encoder[0].in_features:
+            # --- Always log critical errors ---
+            debug_error(f"{indent}[{depth}]    Shape mismatch for {name}: Model expects {model.encoder[0].in_features}, got {params_tensor.shape[1]}")
+        else:
+            _, reconstruction = model(params_tensor)
+            error = torch.max(torch.abs(reconstruction - params_tensor)).item()
+            if detailed_debug: debug_info(f"{indent}[{depth}]    Reconstruction error: {error:.4f} (Threshold: {error_threshold})")
+            
+            if error < error_threshold:
+                # --- Log success only if detailed ---
+                if detailed_debug: debug_success(f"{indent}[{depth}]    SUCCESS: Applying SINGLETON abstraction for {name}!")
+                encoding, _ = model(params_tensor)
+                if detailed_debug: debug_info(f"{indent}[{depth}] Returning NEW Abstraction node: {name}")
+                return Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
+    else:
+        if detailed_debug: debug_info(f"{indent}[{depth}]    No model found for {name}.")
 
+    # --- EXIT (No Abstraction Applied) ---
+    if detailed_debug: debug_info(f"{indent}[{depth}] No abstraction applied. Returning rebuilt {name}.")
     return current_node
