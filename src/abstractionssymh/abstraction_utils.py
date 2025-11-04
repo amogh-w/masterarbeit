@@ -97,19 +97,7 @@ class Autoencoder(nn.Module):
 
 def instantiate_pattern(pattern_name, params, children):
     """Rebuilds a DSL node from a pattern name, parameters, and children.
-
-    Handles both singleton and parent-child pair patterns.
-
-    Args:
-        pattern_name (str): Name of the pattern (e.g., 'Scale', 'Translate(Box)').
-        params (list): Parameters for the node.
-        children (list): Child nodes.
-
-    Returns:
-        DSL node: Reconstructed DSL node.
-
-    Raises:
-        ValueError: If a pattern name is unrecognized or children are missing.
+    FIXED: Now properly handles nested abstraction patterns.
     """
     debug_info(
         f"[INSTANTIATE] Pattern: '{pattern_name}' | params={params[:10]}{'...' if len(params) > 10 else ''} | #children={len(children)}"
@@ -129,59 +117,344 @@ def instantiate_pattern(pattern_name, params, children):
         "SymRot(Union)": 6,
         "SymRot(Translate)": 6,
         "SymTrans(Translate)": 3,
+        # Add the problematic nested patterns
+        "Translate(Abs(Rotate(Scale)))": 3,
+        "Rotate(Abs(Scale))": 4,
+        "Scale(Abs(Rotate))": 3,
     }
 
     # --- SINGLETON RECONSTRUCTION ---
-    if pattern_name in ["Scale", "Rotate", "Translate", "SymRef", "SymRot", "SymTrans"]:
+    # FIX: Check for basic singleton patterns first
+    singleton_patterns = ["Scale", "Rotate", "Translate", "SymRef", "SymRot", "SymTrans"]
+    if pattern_name in singleton_patterns:
+        debug_info(f"  Handling singleton pattern: {pattern_name}")
         NodeClass = globals()[pattern_name]
         child_node = children[0] if children else Box(-1)
 
         if NodeClass == SymRef:
-            return SymRef(child_node, plane_normal=params[:3], point_on_plane=params[3:])
-        if NodeClass == SymRot:
-            return SymRot(child_node, axis=params[:3], center=params[3:], n_fold=-1)
-        if NodeClass == SymTrans:
-            return SymTrans(child_node, end_point=params, n_fold=-1)
-
-        return NodeClass(child_node, params)
+            if len(params) >= 6:
+                return SymRef(child_node, plane_normal=params[:3], point_on_plane=params[3:6])
+            else:
+                debug_error(f"SymRef needs 6 params, got {len(params)}")
+                return Box(-1)
+        elif NodeClass == SymRot:
+            if len(params) >= 6:
+                return SymRot(child_node, axis=params[:3], center=params[3:6], n_fold=-1)
+            else:
+                debug_error(f"SymRot needs 6 params, got {len(params)}")
+                return Box(-1)
+        elif NodeClass == SymTrans:
+            if len(params) >= 3:
+                return SymTrans(child_node, end_point=params[:3], n_fold=-1)
+            else:
+                debug_error(f"SymTrans needs 3 params, got {len(params)}")
+                return Box(-1)
+        elif NodeClass == Rotate:
+            if len(params) >= 4:
+                return Rotate(child_node, params[:4])  # quaternion
+            else:
+                debug_error(f"Rotate needs 4 params, got {len(params)}")
+                return Box(-1)
+        elif NodeClass == Translate:
+            if len(params) >= 3:
+                return Translate(child_node, params[:3])  # center
+            else:
+                debug_error(f"Translate needs 3 params, got {len(params)}")
+                return Box(-1)
+        elif NodeClass == Scale:
+            if len(params) >= 3:
+                return Scale(child_node, params[:3])  # lengths
+            else:
+                debug_error(f"Scale needs 3 params, got {len(params)}")
+                return Box(-1)
+        else:
+            return NodeClass(child_node, params)
 
     # --- PAIR RECONSTRUCTION ---
     elif pattern_name in param_split:
         p_len = param_split[pattern_name]
         p_params, c_params = params[:p_len], params[p_len:]
-        parent_name, child_name = pattern_name.split("(")[0], pattern_name.split("(")[1][:-1]
-        ParentClass, ChildClass = globals()[parent_name], globals()[child_name]
-
-        # --- Build child node ---
-        grandchild_node = children[0] if children else Box(-1)
-        if ChildClass == Box:
-            child_node = Box(-1)
-        elif ChildClass == Union:
-            child_node = Union(children[0], children[1]) if len(children) >= 2 else Box(-1)
-        elif ChildClass == SymRef:
-            child_node = SymRef(grandchild_node, plane_normal=c_params[:3], point_on_plane=c_params[3:])
-        elif ChildClass == SymRot:
-            child_node = SymRot(grandchild_node, axis=c_params[:3], center=c_params[3:], n_fold=-1)
-        elif ChildClass == SymTrans:
-            child_node = SymTrans(grandchild_node, end_point=c_params, n_fold=-1)
+        
+        # Extract parent and child names - FIXED: Handle nested abstractions properly
+        if '(' in pattern_name and ')' in pattern_name:
+            # Find the first opening parenthesis and the last closing parenthesis
+            first_paren = pattern_name.find('(')
+            last_paren = pattern_name.rfind(')')
+            
+            parent_name = pattern_name[:first_paren]
+            child_name = pattern_name[first_paren+1:last_paren]  # Get everything between ( and )
         else:
-            child_node = ChildClass(grandchild_node, c_params)
+            debug_error(f"Invalid pair pattern: {pattern_name}")
+            return Box(-1)
+        
+        debug_info(f"  Parent: {parent_name} with params {p_params}")
+        debug_info(f"  Child: {child_name} with params {c_params}")
 
-        # --- Build parent node ---
-        if ParentClass == Union:
-            return Union(child_node, children[1]) if len(children) >= 2 else Box(-1)
-        elif ParentClass == SymRef:
-            return SymRef(child_node, plane_normal=p_params[:3], point_on_plane=p_params[3:])
-        elif ParentClass == SymRot:
-            return SymRot(child_node, axis=p_params[:3], center=p_params[3:], n_fold=-1)
-        elif ParentClass == SymTrans:
-            return SymTrans(child_node, end_point=p_params, n_fold=-1)
-        else:
-            return ParentClass(child_node, p_params)
+        try:
+            ParentClass = globals()[parent_name]
+            
+            # Handle abstraction children - FIXED: Properly handle nested abstraction patterns
+            if child_name.startswith("Abs("):
+                # The entire child_name is an abstraction pattern like "Abs(Rotate(Scale))"
+                child_node = Abstraction(child_name, c_params, model=None, children=children)
+            else:
+                # Regular DSL class child
+                ChildClass = globals()[child_name]
+                grandchild_node = children[0] if children else Box(-1)
+                
+                if ChildClass == Box:
+                    child_node = Box(-1)
+                elif ChildClass == Union:
+                    child_node = Union(children[0], children[1]) if len(children) >= 2 else Box(-1)
+                elif ChildClass == SymRef:
+                    child_node = SymRef(grandchild_node, plane_normal=c_params[:3], point_on_plane=c_params[3:6]) if len(c_params) >= 6 else Box(-1)
+                elif ChildClass == SymRot:
+                    child_node = SymRot(grandchild_node, axis=c_params[:3], center=c_params[3:6], n_fold=-1) if len(c_params) >= 6 else Box(-1)
+                elif ChildClass == SymTrans:
+                    child_node = SymTrans(grandchild_node, end_point=c_params[:3], n_fold=-1) if len(c_params) >= 3 else Box(-1)
+                elif ChildClass == Rotate:
+                    child_node = Rotate(grandchild_node, c_params[:4]) if len(c_params) >= 4 else Box(-1)
+                elif ChildClass == Translate:
+                    child_node = Translate(grandchild_node, c_params[:3]) if len(c_params) >= 3 else Box(-1)
+                elif ChildClass == Scale:
+                    child_node = Scale(grandchild_node, c_params[:3]) if len(c_params) >= 3 else Box(-1)
+                else:
+                    child_node = ChildClass(grandchild_node, c_params)
+
+            # Build parent node
+            if ParentClass == Union:
+                return Union(child_node, children[1]) if len(children) >= 2 else Box(-1)
+            elif ParentClass == SymRef:
+                return SymRef(child_node, plane_normal=p_params[:3], point_on_plane=p_params[3:6]) if len(p_params) >= 6 else Box(-1)
+            elif ParentClass == SymRot:
+                return SymRot(child_node, axis=p_params[:3], center=p_params[3:6], n_fold=-1) if len(p_params) >= 6 else Box(-1)
+            elif ParentClass == SymTrans:
+                return SymTrans(child_node, end_point=p_params[:3], n_fold=-1) if len(p_params) >= 3 else Box(-1)
+            elif ParentClass == Rotate:
+                return Rotate(child_node, p_params[:4]) if len(p_params) >= 4 else Box(-1)
+            elif ParentClass == Translate:
+                return Translate(child_node, p_params[:3]) if len(p_params) >= 3 else Box(-1)
+            elif ParentClass == Scale:
+                return Scale(child_node, p_params[:3]) if len(p_params) >= 3 else Box(-1)
+            else:
+                return ParentClass(child_node, p_params)
+                
+        except KeyError as e:
+            debug_error(f"Unknown class in pattern {pattern_name}: {e}")
+            return Box(-1)
 
     debug_error(f"[UNKNOWN PATTERN] '{pattern_name}', defaulting to Box(-1)")
     return Box(-1)
 
+def expand_l2_to_l1(l2_dsl_node, singleton_models_L1, pair_models_L1, singleton_models_L2, pair_models_L2):
+    """
+    Expand L2 abstractions to L1 abstractions using pre-loaded models. (FIXED)
+    """
+    
+    def _expand_node(node):
+        """Recursively expand a node using the appropriate models."""
+        if not hasattr(node, 'serialize') and not isinstance(node, Abstraction):
+            return node
+            
+        if isinstance(node, Abstraction):
+            pattern_name = node.pattern_name
+            
+            # Case 1: This is already an L1 Abstraction (wasn't abstracted by L2)
+            if pattern_name in pair_models_L1 or pattern_name in singleton_models_L1:
+                debug_info(f"Node is already L1 abstraction: {pattern_name}. Recursing.")
+                expanded_children = [_expand_node(child) for child in node.children]
+                l1_model = pair_models_L1.get(pattern_name) or singleton_models_L1.get(pattern_name)
+                return Abstraction(pattern_name, node.compressed_params, l1_model, expanded_children)
+
+            # Case 2: This is an L2 Abstraction. Find L2 model.
+            model = None
+            if pattern_name in pair_models_L2:
+                model = pair_models_L2[pattern_name]
+            elif pattern_name in singleton_models_L2:
+                model = singleton_models_L2[pattern_name]
+            
+            if not model:
+                debug_error(f"No L1 or L2 model found for: {pattern_name}")
+                if node.children:
+                    return _expand_node(node.children[0]) # Expand first child
+                else:
+                    return Box(-1)
+
+            # It's an L2 model, so decode it
+            debug_info(f"Expanding L2 abstraction: {pattern_name}")
+            model.eval()
+            with torch.no_grad():
+                params_tensor = t(torch.tensor(node.compressed_params, dtype=torch.float32)).unsqueeze(0)
+                reconstructed_params = model.decoder(params_tensor).squeeze().tolist()
+            
+            # Recursively expand children first
+            expanded_children = [_expand_node(child) for child in node.children]
+            
+            # Manually instantiate the L1 structure based on the L2 pattern
+            
+            # --- L2 PAIR PATTERNS ---
+            if pattern_name == "Translate(Abs(Rotate(Scale)))":
+                # L0 Translate params = 3
+                translate_params = reconstructed_params[:3]
+                # Compressed L1 Abs(Rotate(Scale)) params = 6 (from 7-1)
+                l1_compressed_params = reconstructed_params[3:]
+                l1_model = pair_models_L1.get("Rotate(Scale)")
+                
+                if l1_model:
+                    l1_abs = Abstraction("Rotate(Scale)", l1_compressed_params, l1_model, expanded_children)
+                    return Translate(l1_abs, translate_params)
+                else:
+                    debug_error("Missing L1 model for Rotate(Scale)")
+                    return Box(-1)
+                
+            elif pattern_name == "Translate(Abs(SymRef))":
+                # L0 Translate params = 3
+                translate_params = reconstructed_params[:3]
+                # Compressed L1 Abs(SymRef) params = 5 (from 6-1)
+                l1_compressed_params = reconstructed_params[3:]
+                l1_model = singleton_models_L1.get("SymRef")
+                
+                if l1_model:
+                    l1_abs = Abstraction("SymRef", l1_compressed_params, l1_model, expanded_children)
+                    return Translate(l1_abs, translate_params)
+                else:
+                    debug_error("Missing L1 model for SymRef")
+                    return Box(-1)
+
+            # --- L2 SINGLETON PATTERNS ---
+            elif pattern_name == "Abs(Rotate(Scale))":
+                l1_compressed_params = reconstructed_params # All params are for the L1 node
+                l1_model = pair_models_L1.get("Rotate(Scale)")
+                
+                if l1_model:
+                    return Abstraction("Rotate(Scale)", l1_compressed_params, l1_model, expanded_children)
+                else:
+                    debug_error("Missing L1 model for Rotate(Scale)")
+                    return Box(-1)
+                    
+            elif pattern_name == "Abs(SymRef)":
+                l1_compressed_params = reconstructed_params # All params are for the L1 node
+                l1_model = singleton_models_L1.get("SymRef")
+                
+                if l1_model:
+                    return Abstraction("SymRef", l1_compressed_params, l1_model, expanded_children)
+                else:
+                    debug_error("Missing L1 model for SymRef")
+                    return Box(-1)
+
+            else:
+                debug_info(f"Unhandled L2 pattern: {pattern_name}. Falling back.")
+                if expanded_children:
+                    return expanded_children[0]
+                else:
+                    return Box(-1)
+
+        else:
+            # Regular DSL node - recurse and rebuild
+            if isinstance(node, Box):
+                return node
+            elif isinstance(node, Translate):
+                return Translate(_expand_node(node.child), node.center)
+            elif isinstance(node, Rotate):
+                return Rotate(_expand_node(node.child), node.quaternion)
+            elif isinstance(node, Scale):
+                return Scale(_expand_node(node.child), node.lengths)
+            elif isinstance(node, Union):
+                return Union(_expand_node(node.left), _expand_node(node.right))
+            elif isinstance(node, SymRef):
+                return SymRef(_expand_node(node.child), node.plane, node.point_on_plane)
+            elif isinstance(node, SymRot):
+                return SymRot(_expand_node(node.child), node.axis, node.center, node.n)
+            elif isinstance(node, SymTrans):
+                return SymTrans(_expand_node(node.child), node.end_point, node.n)
+            else:
+                return node
+    
+    debug_info("Starting L2 to L1 expansion with pre-loaded models...")
+    result = _expand_node(l2_dsl_node)
+    debug_success("L2 to L1 expansion completed")
+    return result
+
+def expand_l1_to_l0(l1_dsl_node, singleton_models_L1, pair_models_L1):
+    """
+    Expand L1 abstractions to L0 (concrete DSL) using pre-loaded L1 models. (FIXED)
+    """
+    
+    def _expand_node(node):
+        if not hasattr(node, 'serialize') and not isinstance(node, Abstraction):
+            return node
+            
+        if isinstance(node, Abstraction):
+            debug_info(f"Expanding L1 abstraction: {node.pattern_name}")
+            
+            # Get the appropriate L1 model
+            model = None
+            if node.pattern_name in pair_models_L1:
+                model = pair_models_L1[node.pattern_name]
+            elif node.pattern_name in singleton_models_L1:
+                model = singleton_models_L1[node.pattern_name]
+            
+            if not model:
+                debug_error(f"No L1 model found for: {node.pattern_name}")
+                if node.children:
+                    return _expand_node(node.children[0]) # Expand first child
+                else:
+                    return Box(-1)
+            
+            # Reconstruct parameters using L1 model
+            model.eval()
+            with torch.no_grad():
+                # Handle empty/None params
+                if not node.compressed_params:
+                     reconstructed_params = []
+                else:
+                    params_tensor = t(torch.tensor(node.compressed_params, dtype=torch.float32)).unsqueeze(0)
+                    reconstructed_params = model.decoder(params_tensor).squeeze().tolist()
+            
+            debug_info(f"Reconstructed params for {node.pattern_name}")
+            
+            # Expand children
+            expanded_children = [_expand_node(child) for child in node.children]
+            
+            # *** --- THIS IS THE FIX --- ***
+            # Use the robust instantiate_pattern function to build the L0 nodes
+            try:
+                concrete_node = instantiate_pattern(node.pattern_name, reconstructed_params, expanded_children)
+                debug_success(f"Successfully instantiated L0 node for {node.pattern_name}")
+                return concrete_node
+            except Exception as e:
+                debug_error(f"instantiate_pattern FAILED for {node.pattern_name}: {e}")
+                if expanded_children:
+                    return expanded_children[0]
+                else:
+                    return Box(-1)
+            # *** --- END OF FIX --- ***
+        
+        else:
+            # Regular DSL node - recurse and rebuild
+            if isinstance(node, Box):
+                return node
+            elif isinstance(node, Translate):
+                return Translate(_expand_node(node.child), node.center)
+            elif isinstance(node, Rotate):
+                return Rotate(_expand_node(node.child), node.quaternion)
+            elif isinstance(node, Scale):
+                return Scale(_expand_node(node.child), node.lengths)
+            elif isinstance(node, Union):
+                return Union(_expand_node(node.left), _expand_node(node.right))
+            elif isinstance(node, SymRef):
+                return SymRef(_expand_node(node.child), node.plane, node.point_on_plane)
+            elif isinstance(node, SymRot):
+                return SymRot(_expand_node(node.child), node.axis, node.center, node.n)
+            elif isinstance(node, SymTrans):
+                return SymTrans(_expand_node(node.child), node.end_point, node.n)
+            else:
+                return node
+    
+    debug_info("Starting L1 to L0 expansion...")
+    result = _expand_node(l1_dsl_node)
+    debug_success("L1 to L0 expansion completed")
+    return result
 
 class Abstraction:
     """Represents a compressed DSL pattern using an autoencoder."""
