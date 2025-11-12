@@ -285,7 +285,14 @@ def expand_l2_to_l1(l2_dsl_node, singleton_models_L1, pair_models_L1, singleton_
             model.eval()
             with torch.no_grad():
                 params_tensor = t(torch.tensor(node.compressed_params, dtype=torch.float32)).unsqueeze(0)
-                reconstructed_params = model.decoder(params_tensor).squeeze().tolist()
+                
+                # 1. Decoder outputs *normalized* parameters
+                normalized_reconstruction = model.decoder(params_tensor)
+                
+                # 2. Un-normalize
+                reconstructed_params_tensor = (normalized_reconstruction * model.data_std_) + model.data_mean_
+
+                reconstructed_params = reconstructed_params_tensor.squeeze().tolist()
             
             # Recursively expand children first
             expanded_children = [_expand_node(child) for child in node.children]
@@ -406,11 +413,18 @@ def expand_l1_to_l0(l1_dsl_node, singleton_models_L1, pair_models_L1):
             with torch.no_grad():
                 # Handle empty/None params
                 if not node.compressed_params:
-                     reconstructed_params = []
+                    reconstructed_params = []
                 else:
                     params_tensor = t(torch.tensor(node.compressed_params, dtype=torch.float32)).unsqueeze(0)
-                    reconstructed_params = model.decoder(params_tensor).squeeze().tolist()
-            
+                    
+                    # 1. Decoder outputs *normalized* parameters
+                    normalized_reconstruction = model.decoder(params_tensor)
+                    
+                    # 2. Un-normalize
+                    reconstructed_params_tensor = (normalized_reconstruction * model.data_std_) + model.data_mean_
+                    
+                    reconstructed_params = reconstructed_params_tensor.squeeze().tolist()
+
             debug_info(f"Reconstructed params for {node.pattern_name}")
             
             # Expand children
@@ -488,6 +502,7 @@ class Abstraction:
 
     def expand(self):
         """Reconstructs the full DSL node from compressed parameters.
+        *** MODIFIED to un-normalize the reconstructed parameters. ***
 
         Returns:
             DSL node: Expanded DSL node.
@@ -500,20 +515,30 @@ class Abstraction:
         self.model.eval()
         with torch.no_grad():
             params_tensor = t(torch.tensor(self.compressed_params, dtype=torch.float32)).unsqueeze(0)
-            reconstructed_params = self.model.decoder(params_tensor).squeeze().tolist()
-            debug_success(f"Reconstructed params: {reconstructed_params}")
+            
+            # 1. Decoder outputs *normalized* parameters
+            normalized_reconstruction = self.model.decoder(params_tensor)
+            
+            # 2. Un-normalize the parameters
+            reconstructed_params_tensor = (normalized_reconstruction * self.model.data_std_) + self.model.data_mean_
+            
+            reconstructed_params = reconstructed_params_tensor.squeeze().tolist()
+            debug_success(f"Reconstructed (un-normalized) params: {reconstructed_params}")
 
         rebuilt_node = instantiate_pattern(self.pattern_name, reconstructed_params, self.children)
         debug_success(f"Successfully rebuilt node: {rebuilt_node}")
         return rebuilt_node.expand()
 
 
-def prepare_autoencoder_train_data(parameters, mask, batch_size=BATCH_SIZE):
+def prepare_autoencoder_train_data(parameters, mask, data_mean, data_std, batch_size=BATCH_SIZE):
     """Creates a DataLoader from parameters and a boolean mask.
+    *** MODIFIED to normalize data using provided stats. ***
 
     Args:
         parameters (list): Parameter vectors.
         mask (torch.Tensor): Boolean mask selecting examples.
+        data_mean (torch.Tensor): Mean vector for normalization.
+        data_std (torch.Tensor): Standard deviation vector for normalization.
         batch_size (int, optional): Batch size. Defaults to BATCH_SIZE.
 
     Returns:
@@ -522,16 +547,27 @@ def prepare_autoencoder_train_data(parameters, mask, batch_size=BATCH_SIZE):
     tensor = t(torch.tensor(parameters, dtype=torch.float32))
     if mask.shape[0] != tensor.shape[0]:
         raise ValueError(f"Mask size {mask.shape[0]} != data size {tensor.shape[0]}")
-    dataloader = DataLoader(TensorDataset(tensor[mask]), batch_size=batch_size, shuffle=True)
+    
+    # Select data first, then normalize
+    masked_tensor = tensor[mask]
+    
+    # Move mean/std to the same device as the tensor
+    data_mean_dev = data_mean.to(masked_tensor.device)
+    data_std_dev = data_std.to(masked_tensor.device)
+    
+    normalized_tensor = (masked_tensor - data_mean_dev) / data_std_dev
+    
+    dataloader = DataLoader(TensorDataset(normalized_tensor), batch_size=batch_size, shuffle=True)
     return dataloader
 
 
 def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD):
     """Determines if a parameter set is well reconstructed by an autoencoder.
+    *** MODIFIED to use model's mean/std for normalization. ***
 
     Args:
-        model (Autoencoder): Trained autoencoder.
-        parameters_tensor (torch.Tensor): Input parameter vectors.
+        model (Autoencoder): Trained autoencoder (must have .data_mean_ and .data_std_).
+        parameters_tensor (torch.Tensor): Input parameter vectors (un-normalized).
         error_threshold (float, optional): Maximum reconstruction error allowed.
 
     Returns:
@@ -539,8 +575,15 @@ def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD)
     """
     model.eval()
     with torch.no_grad():
-        _, reconstructions = model(parameters_tensor)
-        error, _ = torch.max(torch.abs(reconstructions - parameters_tensor), dim=-1)
+        # Normalize the input data using the model's stored stats
+        normalized_input = (parameters_tensor - model.data_mean_) / model.data_std_
+        
+        # Model takes normalized input and produces normalized output
+        _, reconstructions = model(normalized_input)
+        
+        # Compare normalized reconstruction to normalized input
+        error, _ = torch.max(torch.abs(reconstructions - normalized_input), dim=-1)
+        
     well_explained = error < error_threshold
     return well_explained
 
@@ -646,6 +689,7 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
 def find_abstractions(structures, structure_type="PATTERNS", min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
                       retrain_iterations=RETRAIN_ITERATIONS, error_threshold=ERROR_THRESHOLD, epochs=EPOCHS):
     """Trains autoencoders for each structure type and returns models.
+    *** MODIFIED to calculate and store normalization stats (mean/std) on the model. ***
 
     Args:
         structures (dict): Mapping pattern names to parameter lists.
@@ -656,7 +700,7 @@ def find_abstractions(structures, structure_type="PATTERNS", min_examples=MIN_EX
         epochs (int, optional): Training epochs.
 
     Returns:
-        dict: Trained models keyed by pattern name.
+        dict: Trained models (with .data_mean_ and .data_std_) keyed by pattern name.
     """
     trained_models = {}
     sorted_structures = sorted(structures.items(), key=lambda item: len(item[1]), reverse=True)
@@ -666,16 +710,48 @@ def find_abstractions(structures, structure_type="PATTERNS", min_examples=MIN_EX
         num_params = len(parameters[0])
         if num_params <= 1:
             continue
+            
         params_tensor = t(torch.tensor(parameters, dtype=torch.float32))
-        mask = torch.ones(len(parameters), dtype=torch.bool)
+        mask = torch.ones(len(parameters), dtype=torch.bool, device=DEVICE)
+        
+        model = None # Define model in outer scope
+
         for iteration in range(retrain_iterations):
-            if not mask.any():
+            current_params = params_tensor[mask]
+            if not current_params.any():
+                debug_info(f"No more data for {name} in iteration {iteration+1}.")
                 break
-            dataloader = prepare_autoencoder_train_data(parameters, mask=mask)
+            
+            # 1. Calculate stats from the *current* subset of data
+            data_mean = torch.mean(current_params, dim=0)
+            data_std = torch.std(current_params, dim=0)
+            # Prevent division by zero for constant features
+            data_std[data_std == 0] = 1.0 
+            
+            # 2. Prepare dataloader with normalized data
+            dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
+            if len(dataloader.dataset) == 0:
+                 debug_info(f"Empty dataloader for {name} in iteration {iteration+1}.")
+                 break
+
+            # 3. Create model and attach stats
             model = Autoencoder(num_params, max(1, num_params - 1)).to(DEVICE)
+            model.data_mean_ = data_mean.to(DEVICE)
+            model.data_std_ = data_std.to(DEVICE)
+            
+            # 4. Train
             model = train_autoencoder(model, dataloader, model_name=name, epochs=epochs)
+            
+            # 5. Re-evaluate mask on *all* data using the new model
+            # is_well_explained will use the stats stored on the model
             mask = is_well_explained(model, params_tensor, error_threshold)
-        trained_models[name] = model
+            
+            debug_info(f"[{name} Iter {iteration+1}] Kept {mask.sum().item()}/{len(parameters)} examples.")
+
+        # Store the final model from the last iteration
+        if model is not None and mask.any():
+            trained_models[name] = model
+            
     return trained_models
 
 
@@ -683,6 +759,7 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
     """
     Recursively abstracts a DSL tree with trained models.
     *** UPDATED: All detailed logging is now behind the detailed_debug flag. ***
+    *** MODIFIED to normalize data before encoding and checking error. ***
     """
     indent = "  " * depth
     
@@ -775,14 +852,40 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
                     # --- Always log critical errors ---
                     debug_error(f"{indent}[{depth}]    Shape mismatch for {pair_sig}: Model expects {model.encoder[0].in_features}, got {combined.shape[1]}")
                 else:
-                    _, reconstruction = model(combined)
-                    error = torch.max(torch.abs(reconstruction - combined)).item()
+                    # ==========================================================
+                    # --- START NORMALIZATION CHANGE (PAIR) ---
+                    # ==========================================================
+                    
+                    # 1. Normalize the combined parameters
+                    normalized_combined = (combined - model.data_mean_) / model.data_std_
+                    
+                    # 2. Get reconstruction of normalized data
+                    _, reconstruction = model(normalized_combined)
+                    
+                    # 3. Calculate error against normalized data
+                    error = torch.max(torch.abs(reconstruction - normalized_combined)).item()
+                    
+                    # ========================================================
+                    # --- END NORMALIZATION CHANGE (PAIR) ---
+                    # ========================================================
+                    
                     if detailed_debug: debug_info(f"{indent}[{depth}]    Reconstruction error: {error:.4f} (Threshold: {error_threshold})")
                     
                     if error < error_threshold:
                         # --- Log success only if detailed ---
                         if detailed_debug: debug_success(f"{indent}[{depth}]    SUCCESS: Applying PAIR abstraction for {pair_sig}!")
-                        encoding, _ = model(combined)
+                        
+                        # ==========================================================
+                        # --- START NORMALIZATION CHANGE (PAIR ENCODING) ---
+                        # ==========================================================
+                        
+                        # 4. Encode the *normalized* data
+                        encoding, _ = model(normalized_combined)
+                        
+                        # ========================================================
+                        # --- END NORMALIZATION CHANGE (PAIR ENCODING) ---
+                        # ========================================================
+                        
                         grandchildren = [c for c in c_children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
                         if detailed_debug: debug_info(f"{indent}[{depth}] Returning NEW Abstraction node: {pair_sig}")
                         return Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
@@ -808,14 +911,40 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
             # --- Always log critical errors ---
             debug_error(f"{indent}[{depth}]    Shape mismatch for {name}: Model expects {model.encoder[0].in_features}, got {params_tensor.shape[1]}")
         else:
-            _, reconstruction = model(params_tensor)
-            error = torch.max(torch.abs(reconstruction - params_tensor)).item()
+            # ==========================================================
+            # --- START NORMALIZATION CHANGE (SINGLETON) ---
+            # ==========================================================
+            
+            # 1. Normalize the parameters
+            normalized_params = (params_tensor - model.data_mean_) / model.data_std_
+            
+            # 2. Get reconstruction of normalized data
+            _, reconstruction = model(normalized_params)
+            
+            # 3. Calculate error against normalized data
+            error = torch.max(torch.abs(reconstruction - normalized_params)).item()
+            
+            # ========================================================
+            # --- END NORMALIZATION CHANGE (SINGLETON) ---
+            # ========================================================
+            
             if detailed_debug: debug_info(f"{indent}[{depth}]    Reconstruction error: {error:.4f} (Threshold: {error_threshold})")
             
             if error < error_threshold:
                 # --- Log success only if detailed ---
                 if detailed_debug: debug_success(f"{indent}[{depth}]    SUCCESS: Applying SINGLETON abstraction for {name}!")
-                encoding, _ = model(params_tensor)
+                
+                # ==========================================================
+                # --- START NORMALIZATION CHANGE (SINGLETON ENCODING) ---
+                # ==========================================================
+                
+                # 4. Encode the *normalized* data
+                encoding, _ = model(normalized_params)
+                
+                # ========================================================
+                # --- END NORMALIZATION CHANGE (SINGLETON ENCODING) ---
+                # ========================================================
+                
                 if detailed_debug: debug_info(f"{indent}[{depth}] Returning NEW Abstraction node: {name}")
                 return Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
     else:
