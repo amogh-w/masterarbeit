@@ -57,12 +57,15 @@ class Autoencoder(nn.Module):
 
     def __init__(self, input_dim, hidden_dim):
         """Initializes encoder and decoder layers.
+        *** MODIFIED to store input_dim. ***
 
         Args:
             input_dim (int): Dimension of input features.
             hidden_dim (int): Dimension of latent space.
         """
         super().__init__()
+        self.input_dim = input_dim  # <--- ADD THIS LINE
+        self.hidden_dim = hidden_dim # <--- ADD THIS LINE
         debug_info(f"Initializing Autoencoder: input_dim={input_dim}, hidden_dim={hidden_dim}")
 
         self.encoder = nn.Sequential(
@@ -91,6 +94,76 @@ class Autoencoder(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: Latent representation and reconstruction.
         """
         latent = self.encoder(x)
+        decoded = self.decoder(latent)
+        return latent, decoded
+    
+# === In: abstraction_utils.py ===
+# (Place this after the Autoencoder class)
+
+class PCAModel(nn.Module):
+    """
+    A model that uses PCA for encoding/decoding, designed as a 
+    drop-in replacement for the Autoencoder.
+    
+    It expects *normalized* data for fitting and forward pass, and
+    stores the normalization stats just like the Autoencoder.
+    """
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        
+        # We register 'components' as a buffer. It's part of the model's
+        # state and moves with .to(DEVICE), but is not a trainable parameter.
+        self.register_buffer('components', torch.randn(input_dim, hidden_dim))
+        
+        # These will be attached by the find_abstractions_pca function
+        self.data_mean_ = None
+        self.data_std_ = None
+
+    def fit(self, normalized_data_tensor):
+        """
+        'Trains' the PCA model by calculating the principal components.
+        
+        Args:
+            normalized_data_tensor (torch.Tensor): The *normalized* training data.
+        """
+        if normalized_data_tensor.shape[0] < self.input_dim:
+            debug_error(f"PCA fit error: Not enough samples ({normalized_data_tensor.shape[0]}) to compute covariance for {self.input_dim} features.")
+            # Keep random components as a fallback, but this model will be bad
+            return
+            
+        # 1. Calculate covariance matrix
+        # Data should be (n_samples, n_features)
+        cov_matrix = torch.cov(normalized_data_tensor.T)
+        
+        # 2. Get eigenvalues and eigenvectors
+        # eigh is for symmetric matrices (like covariance)
+        # We only need the eigenvectors
+        try:
+            _, eigenvectors = torch.linalg.eigh(cov_matrix)
+        except Exception as e:
+            debug_error(f"PCA linalg.eigh failed: {e}")
+            return # Keep random components
+
+        # 3. Store the top 'hidden_dim' eigenvectors
+        # Eigenvectors are sorted by eigenvalue (ascending), so we take the last ones.
+        self.components = eigenvectors[:, -self.hidden_dim:]
+        debug_success(f"PCA fit complete. Components shape: {self.components.shape}")
+        
+    def encoder(self, normalized_x):
+        """Projects normalized data onto the principal components."""
+        # (N, D) @ (D, K) -> (N, K)
+        return normalized_x @ self.components
+
+    def decoder(self, z):
+        """Reconstructs normalized data from the latent representation."""
+        # (N, K) @ (K, D) -> (N, D)  (where K, D is components.T)
+        return z @ self.components.T
+
+    def forward(self, normalized_x):
+        """Performs a forward pass: encode -> decode."""
+        latent = self.encoder(normalized_x)
         decoded = self.decoder(latent)
         return latent, decoded
 
@@ -754,12 +827,86 @@ def find_abstractions(structures, structure_type="PATTERNS", min_examples=MIN_EX
             
     return trained_models
 
+# === In: abstraction_utils.py ===
+# (Place this after the find_abstractions function)
+
+def find_abstractions_pca(structures, structure_type="PATTERNS", min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
+                          retrain_iterations=RETRAIN_ITERATIONS, error_threshold=ERROR_THRESHOLD):
+    """
+    Finds abstractions using PCA, as a drop-in for find_abstractions.
+    It "trains" by fitting PCA components.
+    
+    Args:
+        structures (dict): Mapping pattern names to parameter lists.
+        structure_type (str, optional): Type description for logging.
+        min_examples (int, optional): Minimum examples to train a model.
+        retrain_iterations (int, optional): Number of retraining passes.
+        error_threshold (float, optional): Maximum reconstruction error allowed.
+
+    Returns:
+        dict: Trained PCAModels (with .data_mean_ and .data_std_) keyed by pattern name.
+    """
+    trained_models = {}
+    sorted_structures = sorted(structures.items(), key=lambda item: len(item[1]), reverse=True)
+    
+    for name, parameters in sorted_structures:
+        if len(parameters) < min_examples:
+            continue
+        num_params = len(parameters[0])
+        if num_params <= 1:
+            continue
+            
+        params_tensor = t(torch.tensor(parameters, dtype=torch.float32))
+        mask = torch.ones(len(parameters), dtype=torch.bool, device=DEVICE)
+        
+        model = None # Define model in outer scope
+        
+        for iteration in range(retrain_iterations):
+            current_params = params_tensor[mask]
+            
+            if not current_params.any() or len(current_params) < 2:
+                debug_info(f"No more data for {name} in iteration {iteration+1}.")
+                break
+            
+            # 1. Calculate stats (mean/std)
+            data_mean = torch.mean(current_params, dim=0)
+            data_std = torch.std(current_params, dim=0)
+            # Prevent division by zero for constant features
+            data_std[data_std == 0] = 1.0 
+            
+            # 2. Normalize the current data subset
+            normalized_current_params = (current_params - data_mean) / data_std
+            
+            # 3. Create PCA model and attach stats
+            # This is your "drop 1 axis" logic
+            hidden_dim = max(1, num_params - 1) 
+            model = PCAModel(num_params, hidden_dim).to(DEVICE)
+            model.data_mean_ = data_mean.to(DEVICE)
+            model.data_std_ = data_std.to(DEVICE)
+            
+            # 4. "Train" (fit) the PCA model on the normalized data
+            debug_info(f"Fitting PCA for {name} (Iter {iteration+1}) on {len(normalized_current_params)} samples...")
+            model.fit(normalized_current_params)
+            
+            # 5. Re-evaluate mask on *all* data using the new model's stats
+            # is_well_explained will use the .data_mean_ and .data_std_
+            mask = is_well_explained(model, params_tensor, error_threshold)
+            
+            debug_info(f"[{name} Iter {iteration+1}] Kept {mask.sum().item()}/{len(parameters)} examples.")
+
+        # Store the final model from the last iteration
+        if model is not None and mask.any():
+            trained_models[name] = model
+            
+    return trained_models
+
 
 def integrate_abstractions(node, singleton_models, pair_models, error_threshold=ERROR_THRESHOLD, depth=0, detailed_debug=False):
     """
     Recursively abstracts a DSL tree with trained models.
     *** UPDATED: All detailed logging is now behind the detailed_debug flag. ***
     *** MODIFIED to normalize data before encoding and checking error. ***
+    *** MODIFIED to check model.input_dim for compatibility. ***
     """
     indent = "  " * depth
     
@@ -848,9 +995,17 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
                 
                 if combined.shape[1] == 0:
                     if detailed_debug: debug_info(f"{indent}[{depth}]    Skipping (no params to abstract).")
-                elif combined.shape[1] != model.encoder[0].in_features:
+                
+                # ==========================================================
+                # --- START OF FIX 1 (PAIR) ---
+                # ==========================================================
+                elif combined.shape[1] != model.input_dim:
+                # ==========================================================
+                # --- END OF FIX 1 (PAIR) ---
+                # ==========================================================
+
                     # --- Always log critical errors ---
-                    debug_error(f"{indent}[{depth}]    Shape mismatch for {pair_sig}: Model expects {model.encoder[0].in_features}, got {combined.shape[1]}")
+                    debug_error(f"{indent}[{depth}]    Shape mismatch for {pair_sig}: Model expects {model.input_dim}, got {combined.shape[1]}")
                 else:
                     # ==========================================================
                     # --- START NORMALIZATION CHANGE (PAIR) ---
@@ -907,9 +1062,16 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
             
         params_tensor = t(torch.tensor(p_params, dtype=torch.float32)).unsqueeze(0)
         
-        if params_tensor.shape[1] != model.encoder[0].in_features:
+        # ==========================================================
+        # --- START OF FIX 2 (SINGLETON) ---
+        # ==========================================================
+        if params_tensor.shape[1] != model.input_dim:
+        # ==========================================================
+        # --- END OF FIX 2 (SINGLETON) ---
+        # ==========================================================
+
             # --- Always log critical errors ---
-            debug_error(f"{indent}[{depth}]    Shape mismatch for {name}: Model expects {model.encoder[0].in_features}, got {params_tensor.shape[1]}")
+            debug_error(f"{indent}[{depth}]    Shape mismatch for {name}: Model expects {model.input_dim}, got {params_tensor.shape[1]}")
         else:
             # ==========================================================
             # --- START NORMALIZATION CHANGE (SINGLETON) ---
