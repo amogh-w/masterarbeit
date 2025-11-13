@@ -1,8 +1,27 @@
-"""
-dsl_conversion.py
+"""dsl_conversion.py
 
 Utilities to convert between hierarchical Tree structures and DSL object trees,
 as well as between DSL objects and JSON-serializable dictionaries.
+
+This module provides the bridges between:
+1.  Raw tensor/MATLAB data (boxes, ops, syms, labels) and a
+    hierarchical `Tree` structure.
+2.  The `Tree` structure and the object-oriented DSL node hierarchy
+    (from `dsl_nodes.py`).
+3.  The DSL node hierarchy and JSON-serializable dictionaries for
+    storage or transmission.
+
+Classes
+-------
+- Tree
+- ShapeData
+
+Functions
+---------
+- tree_to_dsl(node)
+- dsl_to_dict(node)
+- dict_to_dsl(node_dict)
+- parse_json_to_dsl(json_string)
 """
 
 import scipy
@@ -23,28 +42,81 @@ from abstractionssymh.dsl_nodes import (
 )
 
 LABEL_NAMES = {0: "Backrest", 1: "Seat", 2: "Leg", 3: "Armrest"}
+"""dict: Maps integer part labels to human-readable names."""
 
 
 class Tree(object):
-    """Represents a hierarchical tree structure for 3D shape composition."""
+    """Represents a hierarchical tree structure for 3D shape composition.
+
+    This class parses raw tensor data (boxes, ops, syms, labels) from the
+    original dataset format into a nested Python object structure. The tree
+    is built using a queue-based, post-order traversal logic based on
+    the `ops` tensor.
+
+    Attributes
+    ----------
+    root : Tree.Node
+        The root node of the constructed tree.
+
+    Nested Classes
+    --------------
+    NodeType : Enum
+        Defines the types of nodes: BOX, ADJ (adjacency/union), SYM (symmetry).
+    Node : object
+        Represents a single node within the tree.
+    """
 
     class NodeType(Enum):
-        """Node types in the tree."""
+        """Enumeration of node types within the `Tree` structure."""
         BOX, ADJ, SYM = 0, 1, 2
 
     class Node(object):
-        """A single node in the Tree."""
+        """A single node in the Tree.
 
-        def __init__(self, box=None, left=None, right=None, node_type=None, sym=None, label=None):
-            """Initializes a Node.
+        This node can be a leaf (BOX), a binary operator (ADJ),
+        or a unary operator (SYM).
 
-            Args:
-                box: Box tensor for leaf nodes.
-                left: Left child node.
-                right: Right child node.
-                node_type: Type of node (BOX, ADJ, SYM).
-                sym: Symmetry parameters for SYM nodes.
-                label: Label of the box.
+        Attributes
+        ----------
+        box : torch.Tensor or None
+            Tensor data for a BOX leaf node.
+        left : Tree.Node or None
+            The left (or only) child node.
+        right : Tree.Node or None
+            The right child node (for ADJ nodes).
+        node_type : Tree.NodeType
+            The type of this node.
+        sym : torch.Tensor or None
+            Tensor data for a SYM node.
+        label : torch.Tensor or None
+            Label for a BOX leaf node.
+        """
+
+        def __init__(
+            self,
+            box=None,
+            left=None,
+            right=None,
+            node_type=None,
+            sym=None,
+            label=None,
+        ):
+            """Initialize a Node.
+
+            Parameters
+            ----------
+            box : torch.Tensor, optional
+                Box tensor for leaf nodes.
+            left : Tree.Node, optional
+                Left child node.
+            right : Tree.Node, optional
+                Right child node.
+            node_type : Tree.NodeType, optional
+                Type of node (BOX, ADJ, SYM).
+            sym : torch.Tensor, optional
+                Symmetry parameters for SYM nodes.
+            label : torch.Tensor, optional
+                Label of the box.
             """
             self.box, self.sym, self.left, self.right, self.node_type, self.label = (
                 box,
@@ -56,19 +128,54 @@ class Tree(object):
             )
 
         def is_leaf(self):
-            """Returns True if node is a leaf (BOX)."""
+            """Check if this node is a leaf node (BOX).
+
+            Returns
+            -------
+            bool
+                True if node type is BOX, False otherwise.
+            """
             return self.node_type == Tree.NodeType.BOX
 
         def is_adj(self):
-            """Returns True if node is an adjacency (ADJ)."""
+            """Check if this node is an adjacency node (ADJ).
+
+            Returns
+            -------
+            bool
+                True if node type is ADJ, False otherwise.
+            """
             return self.node_type == Tree.NodeType.ADJ
 
         def is_sym(self):
-            """Returns True if node is a symmetry (SYM)."""
+            """Check if this node is a symmetry node (SYM).
+
+            Returns
+            -------
+            bool
+                True if node type is SYM, False otherwise.
+            """
             return self.node_type == Tree.NodeType.SYM
 
     def __init__(self, boxes, ops, syms, labels):
-        """Constructs a Tree from box, op, sym, and label tensors."""
+        """Construct a Tree from raw box, op, sym, and label tensors.
+
+        This constructor implements a queue-based algorithm to build the
+        tree structure from the flat list of operations (`ops`). It
+        processes the operations in reverse order to build the tree
+        from leaves up to the root.
+
+        Parameters
+        ----------
+        boxes : torch.Tensor
+            A tensor of all box parameters.
+        ops : torch.Tensor
+            A tensor defining the tree structure operations (0=BOX, 1=ADJ, 2=SYM).
+        syms : torch.Tensor
+            A tensor of all symmetry parameters.
+        labels : torch.Tensor
+            A tensor of all box labels.
+        """
         box_list = [b for b in torch.split(boxes, 1, 0)]
         sym_param = [s for s in torch.split(syms, 1, 0)]
         label_list = [l for l in labels[0]]
@@ -103,13 +210,40 @@ class Tree(object):
 
 @dataclass
 class ShapeData:
-    """Holds all shape-related data, including boxes, labels, ops, syms, and the tree."""
+    """Holds all shape-related data, loading from `.mat` files.
+
+    This class acts as a data loader and container, parsing MATLAB files
+    for a single shape and providing a method to construct the
+    hierarchical `Tree` object from them.
+
+    Attributes
+    ----------
+    boxes : np.ndarray
+        Raw box data loaded from file.
+    labels : np.ndarray
+        Raw label data loaded from file.
+    ops : np.ndarray
+        Raw operation data loaded from file.
+    syms : np.ndarray
+        Raw symmetry data loaded from file.
+    shapename : str
+        The name of the shape, extracted from the syms file.
+    tree : Tree or None
+        The hierarchical `Tree` object, or None if
+        `construct_tree()` has not been called.
+    """
 
     def __init__(self, row):
-        """Loads shape data from MATLAB .mat files.
+        """Load shape data from paths specified in a row object.
 
-        Args:
-            row: An object containing paths for boxes, labels, ops, and syms.
+        Assumes `row` is an object with attributes `boxes`, `labels`,
+        `ops`, and `syms`, each containing a file path to a `.mat` file.
+
+        Parameters
+        ----------
+        row : object
+            An object (e.g., a pandas Series or namedtuple) containing
+            file paths for boxes, labels, ops, and syms.
         """
         self.boxes = scipy.io.loadmat(row.boxes)["box"]
         self.labels = scipy.io.loadmat(row.labels)["label"]
@@ -120,7 +254,11 @@ class ShapeData:
         self.tree = None
 
     def construct_tree(self):
-        """Converts loaded data into a Tree object."""
+        """Convert loaded NumPy arrays into PyTorch tensors and build the `Tree`.
+
+        Populates the `self.tree` attribute with a `Tree` object based on
+        the loaded file data.
+        """
         boxes_t = torch.tensor(self.boxes, dtype=torch.float).t()
         ops_t = torch.tensor(self.ops, dtype=torch.int)
         syms_t = torch.tensor(self.syms, dtype=torch.float).t()
@@ -130,17 +268,32 @@ class ShapeData:
 
 
 def tree_to_dsl(node):
-    """Recursively converts a Tree node into a corresponding DSL object.
+    """Recursively convert a `Tree.Node` into a corresponding DSL object.
 
-    Args:
-        node: Tree.Node object.
+    This is the main conversion from the raw `Tree` structure
+    (loaded from tensors) into the symbolic, object-oriented `dsl_nodes`
+    representation.
 
-    Returns:
-        DSL node representing the same structure.
+    - `BOX` nodes are converted into a `Translate(Rotate(Scale(Box)))` stack.
+    - `ADJ` nodes are converted into a `Union`.
+    - `SYM` nodes are converted into `SymRef`, `SymRot`, or `SymTrans`.
+
+    Parameters
+    ----------
+    node : Tree.Node
+        The `Tree.Node` object to convert.
+
+    Returns
+    -------
+    object or None
+        A DSL node (e.g., `Box`, `Translate`, `Union`, `SymRef`)
+        corresponding to the input `Tree.Node`. Returns `None`
+        for unhandled node types.
     """
     if node.is_leaf():
         box_vec = node.box.squeeze()
         center = box_vec[0:3].tolist()
+        # Note: Original vector order is [?, ?, ?, y, z, x, dir2..., dir3...]
         dims = [box_vec[5].item(), box_vec[3].item(), box_vec[4].item()]
         label = node.label.item()
         raw_dir2, raw_dir3 = box_vec[6:9].numpy(), box_vec[9:12].numpy()
@@ -149,12 +302,14 @@ def tree_to_dsl(node):
             norm = np.linalg.norm(vec)
             return vec if norm == 0 else vec / norm
 
+        # Reconstruct orthonormal basis (rotation matrix)
         dir2_norm = normalize_vector(raw_dir2)
         dir1_norm = normalize_vector(np.cross(dir2_norm, raw_dir3))
         dir3_norm = normalize_vector(np.cross(dir1_norm, dir2_norm))
         rotation_matrix = np.array([dir1_norm, dir2_norm, dir3_norm]).T
         quaternion = Rotation.from_matrix(rotation_matrix).as_quat().tolist()
 
+        # Build the DSL node stack
         base_box = Box(label=label)
         scaled_box = Scale(child=base_box, lengths=dims)
         rotated_box = Rotate(child=scaled_box, quaternion=quaternion)
@@ -171,13 +326,13 @@ def tree_to_dsl(node):
         sym_vec = node.sym.squeeze()
         sym_type = sym_vec[0].item()
 
-        if sym_type == 0.0:
+        if sym_type == 0.0:  # Reflection Symmetry
             return SymRef(
                 child=child_dsl,
                 plane_normal=sym_vec[1:4].tolist(),
                 point_on_plane=sym_vec[4:7].tolist(),
             )
-        elif sym_type == -1.0:
+        elif sym_type == -1.0:  # Rotational Symmetry
             n_fold_param = sym_vec[7].item()
             n_fold = int(round(1.0 / n_fold_param)) if n_fold_param != 0 else 1
             return SymRot(
@@ -186,7 +341,7 @@ def tree_to_dsl(node):
                 center=sym_vec[4:7].tolist(),
                 n_fold=n_fold,
             )
-        elif sym_type == 1.0:
+        elif sym_type == 1.0:  # Translational Symmetry
             n_fold_param = sym_vec[7].item()
             n_fold = int(round(1.0 / n_fold_param)) if n_fold_param != 0 else 1
             return SymTrans(
@@ -197,13 +352,33 @@ def tree_to_dsl(node):
 
 
 def dsl_to_dict(node):
-    """Converts a DSL node into a JSON-serializable dictionary.
+    """Convert a DSL node into a serializable dictionary.
 
-    Args:
-        node: DSL node object.
+    Recursively traverses the DSL object tree and converts each node
+    (e.g., `Box`, `Scale`) into a dictionary with a "type" field
+    and associated parameters.
 
-    Returns:
-        Dictionary representation of the node.
+    Note
+    ----
+    This function stores parameters (e.g., `center`, `lengths`)
+    as `np.ndarray` objects. For pure JSON serialization, these
+    arrays must be converted to lists (e.g., using `.tolist()`)
+    or a custom JSON encoder is required.
+
+    Parameters
+    ----------
+    node : object
+        A DSL node object from `dsl_nodes` (e.g., `Box`, `Scale`).
+
+    Returns
+    -------
+    dict
+        A nested dictionary representation of the DSL node.
+
+    Raises
+    ------
+    TypeError
+        If an object of an unknown type is encountered.
     """
     if isinstance(node, Box):
         return {"type": "Box", "label": node.label}
@@ -257,17 +432,29 @@ def dsl_to_dict(node):
 
 
 def dict_to_dsl(node_dict):
-    """Converts a JSON-like dictionary back into a DSL node.
+    """Convert a dictionary representation back into a DSL node.
 
-    Args:
-        node_dict: Dictionary representation of a DSL node.
+    Recursively reconstructs the DSL object tree from a nested
+    dictionary (presumably from `dsl_to_dict` or JSON). Assumes
+    parameter values (e.g., `center`) are in a format
+    (like list or `np.ndarray`) consumable by the DSL node constructors.
 
-    Returns:
-        Corresponding DSL node object.
+    Parameters
+    ----------
+    node_dict : dict
+        Dictionary representation of a DSL node.
 
-    Raises:
-        TypeError: If the input is not a dictionary.
-        ValueError: If the node type is unknown.
+    Returns
+    -------
+    object
+        The corresponding DSL node object (e.g., `Box`, `Translate`).
+
+    Raises
+    ------
+    TypeError
+        If the input `node_dict` is not a dictionary.
+    ValueError
+        If the dictionary contains an unknown "type" field.
     """
     if not isinstance(node_dict, dict):
         raise TypeError("Input must be a dictionary.")
@@ -314,13 +501,21 @@ def dict_to_dsl(node_dict):
 
 
 def parse_json_to_dsl(json_string):
-    """Parses a JSON string into a DSL node.
+    """Parse a JSON string into a DSL node.
 
-    Args:
-        json_string: JSON string representing a DSL structure.
+    A simple wrapper that calls `json.loads` and then `dict_to_dsl`.
+    This assumes the JSON string does not contain `np.ndarray`s
+    and that all arrays are represented as standard JSON lists.
 
-    Returns:
-        DSL node object.
+    Parameters
+    ----------
+    json_string : str
+        A JSON string representing a DSL structure.
+
+    Returns
+    -------
+    object
+        The corresponding DSL node object.
     """
     import json
 

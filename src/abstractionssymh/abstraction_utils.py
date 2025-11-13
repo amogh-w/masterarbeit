@@ -1,3 +1,31 @@
+"""
+abstraction_utils.py
+
+This module provides the core logic for finding, training, and applying
+hierarchical abstractions to Domain-Specific Language (DSL) trees. It
+introduces the `Abstraction` node, which acts as a "subroutine" or
+compressed representation of a common DSL pattern.
+
+It supports two main methods for parameter compression:
+1.  **Autoencoder (AE):** A neural network trained to find a low-dimensional
+    latent representation of parameters.
+2.  **PCA (Principal Component Analysis):** A linear dimensionality reduction
+    technique.
+
+Key components:
+-   `Autoencoder` & `PCAModel`: PyTorch modules for data compression.
+-   `Abstraction`: A DSL node-like class that holds compressed parameters.
+-   `find_abstractions`: The main function to *train* models (AE or PCA) on
+    collected DSL parameter data.
+-   `integrate_abstractions`: The main function to *apply* trained models,
+    traversing a DSL tree and replacing concrete patterns with
+    `Abstraction` nodes.
+-   `expand_l1_to_l0` / `expand_l2_to_l1`: Functions to reverse the
+    abstraction, expanding compressed nodes back into concrete DSL trees.
+-   `instantiate_pattern`: A factory function to rebuild concrete DSL
+    nodes from their name and (reconstructed) parameters.
+"""
+
 import re
 import torch
 import torch.nn as nn
@@ -26,14 +54,31 @@ from abstractionssymh.debug_utils import debug_info, debug_error, debug_success
 # ==============================================================================
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+"""torch.device: The computation device (CUDA or CPU) to use."""
+
 AUTOENCODER_LAYER_1_SIZE = 32
+"""int: Size of the first hidden layer in the Autoencoder."""
+
 AUTOENCODER_LAYER_2_SIZE = 16
+"""int: Size of the second hidden layer in the Autoencoder."""
+
 EPOCHS = 50
+"""int: Default number of training epochs for autoencoders."""
+
 BATCH_SIZE = 64
+"""int: Default batch size for training."""
+
 LEARNING_RATE = 1e-3
+"""float: Default learning rate for the AdamW optimizer."""
+
 MIN_EXAMPLES_FOR_ABSTRACTION = 100
+"""int: Minimum number of data points required to train an abstraction model."""
+
 RETRAIN_ITERATIONS = 1
+"""int: Number of iterative retraining passes to filter outliers."""
+
 ERROR_THRESHOLD = 0.05
+"""float: Max normalized reconstruction error to be considered 'well-explained'."""
 
 # ==============================================================================
 # --- CORE LOGIC ---
@@ -41,32 +86,60 @@ ERROR_THRESHOLD = 0.05
 
 
 def t(tensor):
-    """Moves a tensor to the configured device.
+    """Move a tensor to the configured global DEVICE.
 
-    Args:
-        tensor (torch.Tensor): Input tensor.
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        Input tensor.
 
-    Returns:
-        torch.Tensor: Tensor on DEVICE.
+    Returns
+    -------
+    torch.Tensor
+        Tensor moved to the configured DEVICE.
     """
     return tensor.to(DEVICE)
 
 
 class Autoencoder(nn.Module):
-    """Simple fully-connected autoencoder with configurable hidden dimension."""
+    """Simple fully-connected autoencoder with configurable hidden dimension.
+
+    This model learns to compress `input_dim` features into a `hidden_dim`
+    latent space and then reconstruct them.
+
+    Attributes
+    ----------
+    input_dim : int
+        Dimension of the input features.
+    hidden_dim : int
+        Dimension of the latent space (compressed representation).
+    encoder : nn.Sequential
+        The encoder network.
+    decoder : nn.Sequential
+        The decoder network.
+    data_mean_ : torch.Tensor
+        Mean vector of the training data. Attached by `find_abstractions`.
+    data_std_ : torch.Tensor
+        Std dev vector of the training data. Attached by `find_abstractions`.
+    """
 
     def __init__(self, input_dim, hidden_dim):
-        """Initializes encoder and decoder layers.
-        *** MODIFIED to store input_dim. ***
+        """Initialize the encoder and decoder layers.
 
-        Args:
-            input_dim (int): Dimension of input features.
-            hidden_dim (int): Dimension of latent space.
+        Parameters
+        ----------
+        input_dim : int
+            Dimension of input features.
+        hidden_dim : int
+            Dimension of latent space.
         """
         super().__init__()
-        self.input_dim = input_dim  # <--- ADDED THIS LINE
-        self.hidden_dim = hidden_dim # <--- ADDED THIS LINE
-        debug_info(f"Initializing Autoencoder: input_dim={input_dim}, hidden_dim={hidden_dim}")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        debug_info(
+            f"Initializing Autoencoder: "
+            f"input_dim={input_dim}, hidden_dim={hidden_dim}"
+        )
 
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, AUTOENCODER_LAYER_1_SIZE),
@@ -85,13 +158,19 @@ class Autoencoder(nn.Module):
         debug_success("Autoencoder initialized successfully.")
 
     def forward(self, x):
-        """Performs a forward pass through the encoder and decoder.
+        """Perform a forward pass through the encoder and decoder.
 
-        Args:
-            x (torch.Tensor): Input tensor.
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor (expected to be normalized).
 
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Latent representation and reconstruction.
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            A tuple containing:
+            -   `latent`: The latent representation.
+            -   `decoded`: The reconstructed output (still normalized).
         """
         latent = self.encoder(x)
         decoded = self.decoder(latent)
@@ -99,19 +178,41 @@ class Autoencoder(nn.Module):
 
 
 class PCAModel(nn.Module):
-    """
-    A model that uses PCA for encoding/decoding, designed as a 
-    drop-in replacement for the Autoencoder.
-    
-    It expects *normalized* data for fitting and forward pass, and
-    stores the normalization stats just like the Autoencoder.
+    """A model that uses PCA for encoding/decoding.
+
+    This class is designed as a drop-in replacement for the `Autoencoder`.
+    It implements the same `encoder`, `decoder`, and `forward` methods
+    using linear projections based on Principal Component Analysis.
+    It expects *normalized* data for fitting and forward passes.
+
+    Attributes
+    ----------
+    input_dim : int
+        Dimension of the input features.
+    hidden_dim : int
+        Dimension of the latent space (number of principal components).
+    components : torch.Tensor
+        The principal components (eigenvectors), registered as a buffer.
+    data_mean_ : torch.Tensor
+        Mean vector of the training data. Attached by `find_abstractions`.
+    data_std_ : torch.Tensor
+        Std dev vector of the training data. Attached by `find_abstractions`.
     """
     def __init__(self, input_dim, hidden_dim):
+        """Initialize the PCA model structure.
+
+        Parameters
+        ----------
+        input_dim : int
+            Dimension of input features.
+        hidden_dim : int
+            Dimension of latent space (K principal components).
+        """
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         
-        # We register 'components' as a buffer. It's part of the model's
+        # Register 'components' as a buffer. It's part of the model's
         # state and moves with .to(DEVICE), but is not a trainable parameter.
         self.register_buffer('components', torch.randn(input_dim, hidden_dim))
         
@@ -120,58 +221,119 @@ class PCAModel(nn.Module):
         self.data_std_ = None
 
     def fit(self, normalized_data_tensor):
-        """
-        'Trains' the PCA model by calculating the principal components.
-        
-        Args:
-            normalized_data_tensor (torch.Tensor): The *normalized* training data.
+        """'Train' the PCA model by calculating the principal components.
+
+        This method computes the covariance matrix of the normalized data
+        and stores the top `hidden_dim` eigenvectors as the components.
+
+        Parameters
+        ----------
+        normalized_data_tensor : torch.Tensor
+            The *normalized* training data.
         """
         if normalized_data_tensor.shape[0] < self.input_dim:
-            debug_error(f"PCA fit error: Not enough samples ({normalized_data_tensor.shape[0]}) to compute covariance for {self.input_dim} features.")
-            # Keep random components as a fallback, but this model will be bad
+            debug_error(
+                f"PCA fit error: Not enough samples "
+                f"({normalized_data_tensor.shape[0]}) to compute covariance "
+                f"for {self.input_dim} features."
+            )
+            # Keep random components as a fallback
             return
             
         # 1. Calculate covariance matrix
-        # Data should be (n_samples, n_features)
         cov_matrix = torch.cov(normalized_data_tensor.T)
         
         # 2. Get eigenvalues and eigenvectors
-        # eigh is for symmetric matrices (like covariance)
-        # We only need the eigenvectors
         try:
             _, eigenvectors = torch.linalg.eigh(cov_matrix)
         except Exception as e:
             debug_error(f"PCA linalg.eigh failed: {e}")
-            return # Keep random components
+            return  # Keep random components
 
         # 3. Store the top 'hidden_dim' eigenvectors
-        # Eigenvectors are sorted by eigenvalue (ascending), so we take the last ones.
+        # Eigenvectors are sorted by eigenvalue (ascending), so take the last ones.
         self.components = eigenvectors[:, -self.hidden_dim:]
         debug_success(f"PCA fit complete. Components shape: {self.components.shape}")
         
     def encoder(self, normalized_x):
-        """Projects normalized data onto the principal components."""
+        """Project normalized data onto the principal components.
+
+        Parameters
+        ----------
+        normalized_x : torch.Tensor
+            Normalized input data (N, D).
+
+        Returns
+        -------
+        torch.Tensor
+            Latent representation (N, K).
+        """
         # (N, D) @ (D, K) -> (N, K)
         return normalized_x @ self.components
 
     def decoder(self, z):
-        """Reconstructs normalized data from the latent representation."""
-        # (N, K) @ (K, D) -> (N, D)  (where K, D is components.T)
+        """Reconstruct normalized data from the latent representation.
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            Latent representation (N, K).
+
+        Returns
+        -------
+        torch.Tensor
+            Reconstructed normalized data (N, D).
+        """
+        # (N, K) @ (K, D) -> (N, D)  (where (K, D) is components.T)
         return z @ self.components.T
 
     def forward(self, normalized_x):
-        """Performs a forward pass: encode -> decode."""
+        """Perform a forward pass: encode -> decode.
+
+        Parameters
+        ----------
+        normalized_x : torch.Tensor
+            Normalized input data (N, D).
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            A tuple containing:
+            -   `latent`: The latent representation (N, K).
+            -   `decoded`: The reconstructed normalized data (N, D).
+        """
         latent = self.encoder(normalized_x)
         decoded = self.decoder(latent)
         return latent, decoded
 
 
 def instantiate_pattern(pattern_name, params, children):
-    """Rebuilds a DSL node from a pattern name, parameters, and children.
-    FIXED: Now properly handles nested abstraction patterns.
+    """Rebuild a concrete DSL node (or subtree) from its components.
+
+    This factory function is the reverse of `serialize()`. It takes a
+    pattern name (e.g., "Scale", "Translate(Rotate)", "Abs(Scale)"), a
+    list of *un-normalized* parameters, and a list of child nodes,
+    and constructs the corresponding concrete DSL node object.
+
+    Parameters
+    ----------
+    pattern_name : str
+        The name of the pattern to instantiate.
+    params : list
+        The full, un-normalized parameter list for the pattern.
+    children : list
+        A list of child nodes to be attached to the new node(s).
+
+    Returns
+    -------
+    object
+        A concrete DSL node (e.g., `Scale`, `Translate`, `Union`) or
+        `Box(-1)` if instantiation fails.
     """
     debug_info(
-        f"[INSTANTIATE] Pattern: '{pattern_name}' | params={params[:10]}{'...' if len(params) > 10 else ''} | #children={len(children)}"
+        f"[INSTANTIATE] Pattern: '{pattern_name}' | "
+        f"params={params[:10]}{'...' if len(params) > 10 else ''} | "
+        f"#children={len(children)}"
     )
 
     # Predefined mapping for pair patterns: number of parent parameters
@@ -188,15 +350,16 @@ def instantiate_pattern(pattern_name, params, children):
         "SymRot(Union)": 6,
         "SymRot(Translate)": 6,
         "SymTrans(Translate)": 3,
-        # Add the problematic nested patterns
+        # Handle nested abstraction patterns
         "Translate(Abs(Rotate(Scale)))": 3,
         "Rotate(Abs(Scale))": 4,
         "Scale(Abs(Rotate))": 3,
     }
 
     # --- SINGLETON RECONSTRUCTION ---
-    # FIX: Check for basic singleton patterns first
-    singleton_patterns = ["Scale", "Rotate", "Translate", "SymRef", "SymRot", "SymTrans"]
+    singleton_patterns = [
+        "Scale", "Rotate", "Translate", "SymRef", "SymRot", "SymTrans"
+    ]
     if pattern_name in singleton_patterns:
         debug_info(f"  Handling singleton pattern: {pattern_name}")
         NodeClass = globals()[pattern_name]
@@ -204,13 +367,17 @@ def instantiate_pattern(pattern_name, params, children):
 
         if NodeClass == SymRef:
             if len(params) >= 6:
-                return SymRef(child_node, plane_normal=params[:3], point_on_plane=params[3:6])
+                return SymRef(
+                    child_node, plane_normal=params[:3], point_on_plane=params[3:6]
+                )
             else:
                 debug_error(f"SymRef needs 6 params, got {len(params)}")
                 return Box(-1)
         elif NodeClass == SymRot:
             if len(params) >= 6:
-                return SymRot(child_node, axis=params[:3], center=params[3:6], n_fold=-1)
+                return SymRot(
+                    child_node, axis=params[:3], center=params[3:6], n_fold=-1
+                )
             else:
                 debug_error(f"SymRot needs 6 params, got {len(params)}")
                 return Box(-1)
@@ -246,14 +413,13 @@ def instantiate_pattern(pattern_name, params, children):
         p_len = param_split[pattern_name]
         p_params, c_params = params[:p_len], params[p_len:]
         
-        # Extract parent and child names - FIXED: Handle nested abstractions properly
+        # Extract parent and child names
         if '(' in pattern_name and ')' in pattern_name:
-            # Find the first opening parenthesis and the last closing parenthesis
             first_paren = pattern_name.find('(')
             last_paren = pattern_name.rfind(')')
             
             parent_name = pattern_name[:first_paren]
-            child_name = pattern_name[first_paren+1:last_paren]  # Get everything between ( and )
+            child_name = pattern_name[first_paren+1:last_paren]
         else:
             debug_error(f"Invalid pair pattern: {pattern_name}")
             return Box(-1)
@@ -264,49 +430,89 @@ def instantiate_pattern(pattern_name, params, children):
         try:
             ParentClass = globals()[parent_name]
             
-            # Handle abstraction children - FIXED: Properly handle nested abstraction patterns
+            # Handle child node instantiation
             if child_name.startswith("Abs("):
-                # The entire child_name is an abstraction pattern like "Abs(Rotate(Scale))"
-                child_node = Abstraction(child_name, c_params, model=None, children=children)
+                # Child is an Abstraction, reconstruct it
+                child_node = Abstraction(
+                    child_name, c_params, model=None, children=children
+                )
             else:
-                # Regular DSL class child
+                # Child is a regular DSL class
                 ChildClass = globals()[child_name]
                 grandchild_node = children[0] if children else Box(-1)
                 
                 if ChildClass == Box:
                     child_node = Box(-1)
                 elif ChildClass == Union:
-                    child_node = Union(children[0], children[1]) if len(children) >= 2 else Box(-1)
+                    child_node = Union(
+                        children[0], children[1]
+                    ) if len(children) >= 2 else Box(-1)
                 elif ChildClass == SymRef:
-                    child_node = SymRef(grandchild_node, plane_normal=c_params[:3], point_on_plane=c_params[3:6]) if len(c_params) >= 6 else Box(-1)
+                    child_node = SymRef(
+                        grandchild_node,
+                        plane_normal=c_params[:3],
+                        point_on_plane=c_params[3:6]
+                    ) if len(c_params) >= 6 else Box(-1)
                 elif ChildClass == SymRot:
-                    child_node = SymRot(grandchild_node, axis=c_params[:3], center=c_params[3:6], n_fold=-1) if len(c_params) >= 6 else Box(-1)
+                    child_node = SymRot(
+                        grandchild_node,
+                        axis=c_params[:3],
+                        center=c_params[3:6],
+                        n_fold=-1
+                    ) if len(c_params) >= 6 else Box(-1)
                 elif ChildClass == SymTrans:
-                    child_node = SymTrans(grandchild_node, end_point=c_params[:3], n_fold=-1) if len(c_params) >= 3 else Box(-1)
+                    child_node = SymTrans(
+                        grandchild_node, end_point=c_params[:3], n_fold=-1
+                    ) if len(c_params) >= 3 else Box(-1)
                 elif ChildClass == Rotate:
-                    child_node = Rotate(grandchild_node, c_params[:4]) if len(c_params) >= 4 else Box(-1)
+                    child_node = Rotate(
+                        grandchild_node, c_params[:4]
+                    ) if len(c_params) >= 4 else Box(-1)
                 elif ChildClass == Translate:
-                    child_node = Translate(grandchild_node, c_params[:3]) if len(c_params) >= 3 else Box(-1)
+                    child_node = Translate(
+                        grandchild_node, c_params[:3]
+                    ) if len(c_params) >= 3 else Box(-1)
                 elif ChildClass == Scale:
-                    child_node = Scale(grandchild_node, c_params[:3]) if len(c_params) >= 3 else Box(-1)
+                    child_node = Scale(
+                        grandchild_node, c_params[:3]
+                    ) if len(c_params) >= 3 else Box(-1)
                 else:
                     child_node = ChildClass(grandchild_node, c_params)
 
             # Build parent node
             if ParentClass == Union:
-                return Union(child_node, children[1]) if len(children) >= 2 else Box(-1)
+                return Union(
+                    child_node, children[1]
+                ) if len(children) >= 2 else Box(-1)
             elif ParentClass == SymRef:
-                return SymRef(child_node, plane_normal=p_params[:3], point_on_plane=p_params[3:6]) if len(p_params) >= 6 else Box(-1)
+                return SymRef(
+                    child_node,
+                    plane_normal=p_params[:3],
+                    point_on_plane=p_params[3:6]
+                ) if len(p_params) >= 6 else Box(-1)
             elif ParentClass == SymRot:
-                return SymRot(child_node, axis=p_params[:3], center=p_params[3:6], n_fold=-1) if len(p_params) >= 6 else Box(-1)
+                return SymRot(
+                    child_node,
+                    axis=p_params[:3],
+                    center=p_params[3:6],
+                    n_fold=-1
+                ) if len(p_params) >= 6 else Box(-1)
             elif ParentClass == SymTrans:
-                return SymTrans(child_node, end_point=p_params[:3], n_fold=-1) if len(p_params) >= 3 else Box(-1)
+                return SymTrans(
+                    child_node, end_point=p_params[:3], n_fold=-1
+                ) if len(p_params) >= 3 else Box(-1)
             elif ParentClass == Rotate:
-                return Rotate(child_node, p_params[:4]) if len(p_params) >= 4 else Box(-1)
+                return Rotate(
+                    child_node, p_params[:4]
+                ) if len(p_params) >= 4 else Box(-1)
             elif ParentClass == Translate:
-                return Translate(child_node, p_params[:3]) if len(p_params) >= 3 else Box(-1)
+                return Translate(
+                    child_node, p_params[:3]
+                ) if len(p_params) >= 3 else Box(-1)
             elif ParentClass == Scale:
-                return Scale(child_node, p_params[:3]) if len(p_params) >= 3 else Box(-1)
+                return Scale(
+                    child_node, p_params[:3]
+                ) if len(p_params) >= 3 else Box(-1)
             else:
                 return ParentClass(child_node, p_params)
                 
@@ -317,9 +523,38 @@ def instantiate_pattern(pattern_name, params, children):
     debug_error(f"[UNKNOWN PATTERN] '{pattern_name}', defaulting to Box(-1)")
     return Box(-1)
 
-def expand_l2_to_l1(l2_dsl_node, singleton_models_L1, pair_models_L1, singleton_models_L2, pair_models_L2):
-    """
-    Expand L2 abstractions to L1 abstractions using pre-loaded models. (FIXED)
+def expand_l2_to_l1(
+    l2_dsl_node,
+    singleton_models_L1,
+    pair_models_L1,
+    singleton_models_L2,
+    pair_models_L2
+):
+    """Expand a DSL tree from L2 abstractions down to L1 abstractions.
+    
+    This function traverses a tree and, upon finding an L2 `Abstraction`
+    node, uses the corresponding L2 model to decode its parameters.
+    These decoded parameters are then used to construct the underlying
+    L1 structure (which may include new L1 `Abstraction` nodes).
+
+    Parameters
+    ----------
+    l2_dsl_node : object
+        The root of the DSL tree (potentially containing L2 Abstractions).
+    singleton_models_L1 : dict
+        Pre-loaded dictionary of trained L1 singleton models.
+    pair_models_L1 : dict
+        Pre-loaded dictionary of trained L1 pair models.
+    singleton_models_L2 : dict
+        Pre-loaded dictionary of trained L2 singleton models.
+    pair_models_L2 : dict
+        Pre-loaded dictionary of trained L2 pair models.
+
+    Returns
+    -------
+    object
+        The expanded DSL tree, now containing only L0 nodes and
+        L1 `Abstraction` nodes.
     """
     
     def _expand_node(node):
@@ -330,70 +565,80 @@ def expand_l2_to_l1(l2_dsl_node, singleton_models_L1, pair_models_L1, singleton_
         if isinstance(node, Abstraction):
             pattern_name = node.pattern_name
             
-            # Case 1: This is already an L1 Abstraction (wasn't abstracted by L2)
-            if pattern_name in pair_models_L1 or pattern_name in singleton_models_L1:
-                debug_info(f"Node is already L1 abstraction: {pattern_name}. Recursing.")
+            # Case 1: This is already an L1 Abstraction
+            if pattern_name in pair_models_L1 or \
+               pattern_name in singleton_models_L1:
+                debug_info(f"Node is already L1 abstraction: {pattern_name}.")
                 expanded_children = [_expand_node(child) for child in node.children]
-                l1_model = pair_models_L1.get(pattern_name) or singleton_models_L1.get(pattern_name)
-                return Abstraction(pattern_name, node.compressed_params, l1_model, expanded_children)
+                l1_model = pair_models_L1.get(pattern_name) or \
+                           singleton_models_L1.get(pattern_name)
+                return Abstraction(
+                    pattern_name,
+                    node.compressed_params,
+                    l1_model,
+                    expanded_children
+                )
 
             # Case 2: This is an L2 Abstraction. Find L2 model.
-            model = None
-            if pattern_name in pair_models_L2:
-                model = pair_models_L2[pattern_name]
-            elif pattern_name in singleton_models_L2:
-                model = singleton_models_L2[pattern_name]
+            model = pair_models_L2.get(pattern_name) or \
+                    singleton_models_L2.get(pattern_name)
             
             if not model:
                 debug_error(f"No L1 or L2 model found for: {pattern_name}")
-                if node.children:
-                    return _expand_node(node.children[0]) # Expand first child
-                else:
-                    return Box(-1)
+                return _expand_node(node.children[0]) if node.children else Box(-1)
 
             # It's an L2 model, so decode it
             debug_info(f"Expanding L2 abstraction: {pattern_name}")
             model.eval()
             with torch.no_grad():
-                params_tensor = t(torch.tensor(node.compressed_params, dtype=torch.float32)).unsqueeze(0)
+                params_tensor = t(
+                    torch.tensor(node.compressed_params, dtype=torch.float32)
+                ).unsqueeze(0)
                 
                 # 1. Decoder outputs *normalized* parameters
                 normalized_reconstruction = model.decoder(params_tensor)
                 
                 # 2. Un-normalize
-                reconstructed_params_tensor = (normalized_reconstruction * model.data_std_) + model.data_mean_
-
+                reconstructed_params_tensor = (
+                    (normalized_reconstruction * model.data_std_) + model.data_mean_
+                )
                 reconstructed_params = reconstructed_params_tensor.squeeze().tolist()
             
             # Recursively expand children first
             expanded_children = [_expand_node(child) for child in node.children]
             
-            # Manually instantiate the L1 structure based on the L2 pattern
+            # Manually instantiate the L1 structure based on L2 pattern name
             
             # --- L2 PAIR PATTERNS ---
             if pattern_name == "Translate(Abs(Rotate(Scale)))":
-                # L0 Translate params = 3
                 translate_params = reconstructed_params[:3]
-                # Compressed L1 Abs(Rotate(Scale)) params = 6 (from 7-1)
                 l1_compressed_params = reconstructed_params[3:]
                 l1_model = pair_models_L1.get("Rotate(Scale)")
                 
                 if l1_model:
-                    l1_abs = Abstraction("Rotate(Scale)", l1_compressed_params, l1_model, expanded_children)
+                    l1_abs = Abstraction(
+                        "Rotate(Scale)",
+                        l1_compressed_params,
+                        l1_model,
+                        expanded_children
+                    )
                     return Translate(l1_abs, translate_params)
                 else:
                     debug_error("Missing L1 model for Rotate(Scale)")
                     return Box(-1)
-                
+                    
             elif pattern_name == "Translate(Abs(SymRef))":
-                # L0 Translate params = 3
                 translate_params = reconstructed_params[:3]
-                # Compressed L1 Abs(SymRef) params = 5 (from 6-1)
                 l1_compressed_params = reconstructed_params[3:]
                 l1_model = singleton_models_L1.get("SymRef")
                 
                 if l1_model:
-                    l1_abs = Abstraction("SymRef", l1_compressed_params, l1_model, expanded_children)
+                    l1_abs = Abstraction(
+                        "SymRef",
+                        l1_compressed_params,
+                        l1_model,
+                        expanded_children
+                    )
                     return Translate(l1_abs, translate_params)
                 else:
                     debug_error("Missing L1 model for SymRef")
@@ -401,31 +646,38 @@ def expand_l2_to_l1(l2_dsl_node, singleton_models_L1, pair_models_L1, singleton_
 
             # --- L2 SINGLETON PATTERNS ---
             elif pattern_name == "Abs(Rotate(Scale))":
-                l1_compressed_params = reconstructed_params # All params are for the L1 node
+                l1_compressed_params = reconstructed_params
                 l1_model = pair_models_L1.get("Rotate(Scale)")
                 
                 if l1_model:
-                    return Abstraction("Rotate(Scale)", l1_compressed_params, l1_model, expanded_children)
+                    return Abstraction(
+                        "Rotate(Scale)",
+                        l1_compressed_params,
+                        l1_model,
+                        expanded_children
+                    )
                 else:
                     debug_error("Missing L1 model for Rotate(Scale)")
                     return Box(-1)
-                    
+                        
             elif pattern_name == "Abs(SymRef)":
-                l1_compressed_params = reconstructed_params # All params are for the L1 node
+                l1_compressed_params = reconstructed_params
                 l1_model = singleton_models_L1.get("SymRef")
                 
                 if l1_model:
-                    return Abstraction("SymRef", l1_compressed_params, l1_model, expanded_children)
+                    return Abstraction(
+                        "SymRef",
+                        l1_compressed_params,
+                        l1_model,
+                        expanded_children
+                    )
                 else:
                     debug_error("Missing L1 model for SymRef")
                     return Box(-1)
 
             else:
                 debug_info(f"Unhandled L2 pattern: {pattern_name}. Falling back.")
-                if expanded_children:
-                    return expanded_children[0]
-                else:
-                    return Box(-1)
+                return expanded_children[0] if expanded_children else Box(-1)
 
         else:
             # Regular DSL node - recurse and rebuild
@@ -440,11 +692,17 @@ def expand_l2_to_l1(l2_dsl_node, singleton_models_L1, pair_models_L1, singleton_
             elif isinstance(node, Union):
                 return Union(_expand_node(node.left), _expand_node(node.right))
             elif isinstance(node, SymRef):
-                return SymRef(_expand_node(node.child), node.plane, node.point_on_plane)
+                return SymRef(
+                    _expand_node(node.child), node.plane, node.point_on_plane
+                )
             elif isinstance(node, SymRot):
-                return SymRot(_expand_node(node.child), node.axis, node.center, node.n)
+                return SymRot(
+                    _expand_node(node.child), node.axis, node.center, node.n
+                )
             elif isinstance(node, SymTrans):
-                return SymTrans(_expand_node(node.child), node.end_point, node.n)
+                return SymTrans(
+                    _expand_node(node.child), node.end_point, node.n
+                )
             else:
                 return node
     
@@ -454,8 +712,26 @@ def expand_l2_to_l1(l2_dsl_node, singleton_models_L1, pair_models_L1, singleton_
     return result
 
 def expand_l1_to_l0(l1_dsl_node, singleton_models_L1, pair_models_L1):
-    """
-    Expand L1 abstractions to L0 (concrete DSL) using pre-loaded L1 models. (FIXED)
+    """Expand a DSL tree from L1 abstractions down to L0 (concrete) nodes.
+    
+    This function traverses a tree and, upon finding an L1 `Abstraction`
+    node, uses the corresponding L1 model to decode its parameters.
+    It then uses `instantiate_pattern` to build the concrete L0
+    DSL node (or subtree) from the reconstructed parameters.
+
+    Parameters
+    ----------
+    l1_dsl_node : object
+        The root of the DSL tree (potentially containing L1 Abstractions).
+    singleton_models_L1 : dict
+        Pre-loaded dictionary of trained L1 singleton models.
+    pair_models_L1 : dict
+        Pre-loaded dictionary of trained L1 pair models.
+
+    Returns
+    -------
+    object
+        The fully expanded, concrete (L0) DSL tree.
     """
     
     def _expand_node(node):
@@ -466,54 +742,54 @@ def expand_l1_to_l0(l1_dsl_node, singleton_models_L1, pair_models_L1):
             debug_info(f"Expanding L1 abstraction: {node.pattern_name}")
             
             # Get the appropriate L1 model
-            model = None
-            if node.pattern_name in pair_models_L1:
-                model = pair_models_L1[node.pattern_name]
-            elif node.pattern_name in singleton_models_L1:
-                model = singleton_models_L1[node.pattern_name]
+            model = pair_models_L1.get(node.pattern_name) or \
+                    singleton_models_L1.get(node.pattern_name)
             
             if not model:
                 debug_error(f"No L1 model found for: {node.pattern_name}")
-                if node.children:
-                    return _expand_node(node.children[0]) # Expand first child
-                else:
-                    return Box(-1)
+                return _expand_node(node.children[0]) if node.children else Box(-1)
             
             # Reconstruct parameters using L1 model
             model.eval()
             with torch.no_grad():
-                # Handle empty/None params
                 if not node.compressed_params:
                     reconstructed_params = []
                 else:
-                    params_tensor = t(torch.tensor(node.compressed_params, dtype=torch.float32)).unsqueeze(0)
+                    params_tensor = t(
+                        torch.tensor(node.compressed_params, dtype=torch.float32)
+                    ).unsqueeze(0)
                     
                     # 1. Decoder outputs *normalized* parameters
                     normalized_reconstruction = model.decoder(params_tensor)
                     
                     # 2. Un-normalize
-                    reconstructed_params_tensor = (normalized_reconstruction * model.data_std_) + model.data_mean_
-                    
-                    reconstructed_params = reconstructed_params_tensor.squeeze().tolist()
+                    reconstructed_params_tensor = (
+                        (normalized_reconstruction * model.data_std_) +
+                        model.data_mean_
+                    )
+                    reconstructed_params = (
+                        reconstructed_params_tensor.squeeze().tolist()
+                    )
 
             debug_info(f"Reconstructed params for {node.pattern_name}")
             
             # Expand children
             expanded_children = [_expand_node(child) for child in node.children]
             
-            # *** --- THIS IS THE FIX --- ***
             # Use the robust instantiate_pattern function to build the L0 nodes
             try:
-                concrete_node = instantiate_pattern(node.pattern_name, reconstructed_params, expanded_children)
-                debug_success(f"Successfully instantiated L0 node for {node.pattern_name}")
+                concrete_node = instantiate_pattern(
+                    node.pattern_name, reconstructed_params, expanded_children
+                )
+                debug_success(
+                    f"Successfully instantiated L0 node for {node.pattern_name}"
+                )
                 return concrete_node
             except Exception as e:
-                debug_error(f"instantiate_pattern FAILED for {node.pattern_name}: {e}")
-                if expanded_children:
-                    return expanded_children[0]
-                else:
-                    return Box(-1)
-            # *** --- END OF FIX --- ***
+                debug_error(
+                    f"instantiate_pattern FAILED for {node.pattern_name}: {e}"
+                )
+                return expanded_children[0] if expanded_children else Box(-1)
         
         else:
             # Regular DSL node - recurse and rebuild
@@ -528,11 +804,17 @@ def expand_l1_to_l0(l1_dsl_node, singleton_models_L1, pair_models_L1):
             elif isinstance(node, Union):
                 return Union(_expand_node(node.left), _expand_node(node.right))
             elif isinstance(node, SymRef):
-                return SymRef(_expand_node(node.child), node.plane, node.point_on_plane)
+                return SymRef(
+                    _expand_node(node.child), node.plane, node.point_on_plane
+                )
             elif isinstance(node, SymRot):
-                return SymRot(_expand_node(node.child), node.axis, node.center, node.n)
+                return SymRot(
+                    _expand_node(node.child), node.axis, node.center, node.n
+                )
             elif isinstance(node, SymTrans):
-                return SymTrans(_expand_node(node.child), node.end_point, node.n)
+                return SymTrans(
+                    _expand_node(node.child), node.end_point, node.n
+                )
             else:
                 return node
     
@@ -542,16 +824,43 @@ def expand_l1_to_l0(l1_dsl_node, singleton_models_L1, pair_models_L1):
     return result
 
 class Abstraction:
-    """Represents a compressed DSL pattern using an autoencoder."""
+    """Represents a compressed DSL pattern using an autoencoder or PCA.
+
+    This node acts as a "subroutine" in the DSL tree. It stores the
+    name of a common pattern (e.g., "Translate(Rotate)"), a
+    low-dimensional `compressed_params` vector, and the `model`
+    required to decompress those parameters back into their full,
+    concrete form.
+
+    Attributes
+    ----------
+    pattern_name : str
+        Name of the abstracted pattern (e.g., "Scale", "Translate(Rotate)").
+    compressed_params : list
+        The compressed latent representation (a low-dimensional vector).
+    model : Autoencoder or PCAModel
+        The trained model (with attached `data_mean_` and `data_std_`)
+        used for reconstruction.
+    children : list
+        A list of child nodes. For a singleton abstraction like `Abs(Scale)`,
+        the child is the node that `Scale` would have wrapped. For a pair
+        abstraction like `Abs(Translate(Rotate))`, the children are the
+        children of the `Rotate` node.
+    """
 
     def __init__(self, pattern_name, compressed_params, model, children=None):
-        """Initializes an abstraction node.
+        """Initialize an abstraction node.
 
-        Args:
-            pattern_name (str): Name of the pattern.
-            compressed_params (list): Compressed latent representation.
-            model (Autoencoder): Trained autoencoder model for reconstruction.
-            children (list, optional): Child nodes. Defaults to None.
+        Parameters
+        ----------
+        pattern_name : str
+            Name of the pattern.
+        compressed_params : list
+            Compressed latent representation.
+        model : Autoencoder or PCAModel
+            Trained model for reconstruction.
+        children : list, optional
+            Child nodes. Defaults to an empty list.
         """
         self.pattern_name = pattern_name
         self.compressed_params = compressed_params
@@ -559,7 +868,7 @@ class Abstraction:
         self.children = children if children is not None else []
 
     def __str__(self):
-        """Returns a string representation of the abstraction."""
+        """Return a string representation of the abstraction."""
         header = f"Abs({self.pattern_name}, dim={len(self.compressed_params)})"
         param_str = f"compressed_params={self.compressed_params}"
         
@@ -572,48 +881,84 @@ class Abstraction:
     __repr__ = __str__
 
     def expand(self):
-        """Reconstructs the full DSL node from compressed parameters.
-        *** MODIFIED to un-normalize the reconstructed parameters. ***
+        """Reconstruct the full DSL node and call its `expand()` method.
 
-        Returns:
-            DSL node: Expanded DSL node.
+        This is the core "decompression" step. It uses the stored `model`
+        to decode the `compressed_params`, un-normalizes them, and then
+        uses `instantiate_pattern` to build the concrete DSL subtree.
+        Finally, it calls the `.expand()` method of that new subtree
+        to get the final box geometries.
+
+        Returns
+        -------
+        list[dict]
+            A list of box geometry dictionaries, just like any other
+            DSL node's `expand()` method. Returns a single "error" box
+            if expansion fails.
         """
         debug_info(f"Expanding abstraction: {self}")
         if not self.compressed_params:
             debug_error("No compressed params found. Returning Box(-1).")
-            return Box(-1)
+            return Box(-1).expand()  # Return expanded box
 
         self.model.eval()
         with torch.no_grad():
-            params_tensor = t(torch.tensor(self.compressed_params, dtype=torch.float32)).unsqueeze(0)
+            params_tensor = t(
+                torch.tensor(self.compressed_params, dtype=torch.float32)
+            ).unsqueeze(0)
             
             # 1. Decoder outputs *normalized* parameters
             normalized_reconstruction = self.model.decoder(params_tensor)
             
             # 2. Un-normalize the parameters
-            reconstructed_params_tensor = (normalized_reconstruction * self.model.data_std_) + self.model.data_mean_
+            reconstructed_params_tensor = (
+                (normalized_reconstruction * self.model.data_std_) + 
+                self.model.data_mean_
+            )
             
             reconstructed_params = reconstructed_params_tensor.squeeze().tolist()
-            debug_success(f"Reconstructed (un-normalized) params: {reconstructed_params}")
+            debug_success(
+                f"Reconstructed (un-normalized) params: {reconstructed_params}"
+            )
 
-        rebuilt_node = instantiate_pattern(self.pattern_name, reconstructed_params, self.children)
+        rebuilt_node = instantiate_pattern(
+            self.pattern_name, reconstructed_params, self.children
+        )
         debug_success(f"Successfully rebuilt node: {rebuilt_node}")
         return rebuilt_node.expand()
 
 
-def prepare_autoencoder_train_data(parameters, mask, data_mean, data_std, batch_size=BATCH_SIZE):
-    """Creates a DataLoader from parameters and a boolean mask.
-    *** MODIFIED to normalize data using provided stats. ***
+def prepare_autoencoder_train_data(
+    parameters,
+    mask,
+    data_mean,
+    data_std,
+    batch_size=BATCH_SIZE
+):
+    """Create a DataLoader, normalizing data using provided stats.
 
-    Args:
-        parameters (list): Parameter vectors.
-        mask (torch.Tensor): Boolean mask selecting examples.
-        data_mean (torch.Tensor): Mean vector for normalization.
-        data_std (torch.Tensor): Standard deviation vector for normalization.
-        batch_size (int, optional): Batch size. Defaults to BATCH_SIZE.
+    Parameters
+    ----------
+    parameters : list
+        A list of *all* parameter vectors (un-normalized).
+    mask : torch.Tensor
+        Boolean mask selecting which examples to include in the DataLoader.
+    data_mean : torch.Tensor
+        Mean vector (pre-calculated) for normalization.
+    data_std : torch.Tensor
+        Standard deviation vector (pre-calculated) for normalization.
+    batch_size : int, optional
+        Batch size for the DataLoader.
 
-    Returns:
-        DataLoader: PyTorch DataLoader for training.
+    Returns
+    -------
+    DataLoader
+        A PyTorch DataLoader yielding batches of normalized data.
+    
+    Raises
+    ------
+    ValueError
+        If the mask size does not match the number of parameters.
     """
     tensor = t(torch.tensor(parameters, dtype=torch.float32))
     if mask.shape[0] != tensor.shape[0]:
@@ -628,21 +973,37 @@ def prepare_autoencoder_train_data(parameters, mask, data_mean, data_std, batch_
     
     normalized_tensor = (masked_tensor - data_mean_dev) / data_std_dev
     
-    dataloader = DataLoader(TensorDataset(normalized_tensor), batch_size=batch_size, shuffle=True)
+    dataset = TensorDataset(normalized_tensor)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     return dataloader
 
 
-def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD):
-    """Determines if a parameter set is well reconstructed by an autoencoder.
-    *** MODIFIED to use model's mean/std for normalization. ***
+def is_well_explained(
+    model,
+    parameters_tensor,
+    error_threshold=ERROR_THRESHOLD
+):
+    """Check which parameter sets are well reconstructed by a model.
 
-    Args:
-        model (Autoencoder): Trained autoencoder (must have .data_mean_ and .data_std_).
-        parameters_tensor (torch.Tensor): Input parameter vectors (un-normalized).
-        error_threshold (float, optional): Maximum reconstruction error allowed.
+    This function normalizes the input data using the model's stored
+    `data_mean_` and `data_std_`, then computes the reconstruction error
+    in the *normalized* space.
 
-    Returns:
-        torch.BoolTensor: Boolean mask of well-explained examples.
+    Parameters
+    ----------
+    model : Autoencoder or PCAModel
+        The trained model, which must have `data_mean_` and `data_std_`
+        attributes.
+    parameters_tensor : torch.Tensor
+        The *un-normalized* input parameter vectors to check.
+    error_threshold : float, optional
+        The maximum allowed reconstruction error in the normalized space.
+
+    Returns
+    -------
+    torch.BoolTensor
+        A boolean mask where `True` indicates the parameter set was
+        "well-explained" (i.e., had an error below the threshold).
     """
     model.eval()
     with torch.no_grad():
@@ -659,42 +1020,53 @@ def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD)
     return well_explained
 
 
-# --- Helper to create safe filenames (same as models) ---
 def make_safe_filename(name: str, suffix: str = "") -> str:
-    """
-    Creates a safe filename.
-    If suffix is provided, it's appended as an extension.
+    """Create a safe, sanitized filename from a string.
+    
     e.g., ("Translate(Rotate)", "pth") -> "translate_rotate.pth"
-    e.g., ("My Model", "loss_chart.png") -> "my_model.loss_chart.png"
+
+    Parameters
+    ----------
+    name : str
+        The input string (e.g., a pattern name).
+    suffix : str, optional
+        A suffix to append, which will be treated as a file extension
+        (a '.' will be added).
+
+    Returns
+    -------
+    str
+        The sanitized, lower-case filename.
     """
     safe = re.sub(r'[^\w\-]+', '_', name)
     safe = re.sub(r'_+', '_', safe).strip('_').lower()
     if suffix:
-        # Add a dot before the suffix to make it a file extension
+        # Add a dot before the suffix
         return f"{safe}.{suffix}"
-    # Return just the safe name if no suffix
     return safe
 
-# from tqdm import tqdm
-import matplotlib.pyplot as plt
-from pathlib import Path
-import torch
-from torch.optim import AdamW
-import torch.nn as nn
 
 def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE):
-    """
-    Trains an autoencoder with a single tqdm progress bar and plots training loss.
+    """Train an autoencoder, showing progress and plotting loss.
 
-    Args:
-        model (Autoencoder): Model to train.
-        dataloader (DataLoader): Training data.
-        model_name (str): Name for plotting/saving the loss chart.
-        epochs (int, optional): Number of epochs.
-        lr (float, optional): Learning rate.
+    Parameters
+    ----------
+    model : Autoencoder
+        The autoencoder model to train.
+    dataloader : DataLoader
+        A DataLoader yielding batches of *normalized* training data.
+    model_name : str
+        The name of the model (e.g., "Translate(Rotate)") for
+        logging and saving the loss chart.
+    epochs : int, optional
+        Number of epochs to train.
+    lr : float, optional
+        Learning rate for the optimizer.
 
-    Returns:
-        Autoencoder: Trained autoencoder.
+    Returns
+    -------
+    Autoencoder
+        The trained autoencoder model.
     """
     optimizer = AdamW(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
@@ -707,6 +1079,7 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
     with tqdm(total=total_batches, desc=f"Training {model_name}", unit="batch") as pbar:
         for epoch in range(epochs):
             epoch_loss = 0.0
+            num_samples = 0
             for batch in dataloader:
                 x = batch[0].to(DEVICE)
                 optimizer.zero_grad()
@@ -715,24 +1088,26 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
                 loss.backward()
                 optimizer.step()
 
-                epoch_loss += loss.item() * x.size(0)
+                batch_loss = loss.item() * x.size(0)
+                epoch_loss += batch_loss
+                num_samples += x.size(0)
                 global_batch += 1
 
-                avg_batch_loss = epoch_loss / ((global_batch - 1) % len(dataloader) + 1)
                 pbar.set_postfix({
                     "epoch": f"{epoch+1}/{epochs}",
                     "batch_loss": f"{loss.item():.6f}",
-                    "avg_epoch_loss": f"{avg_batch_loss:.6f}"
+                    "avg_epoch_loss": f"{epoch_loss / num_samples:.6f}"
                 })
                 pbar.update(1)
 
             avg_epoch_loss = epoch_loss / len(dataloader.dataset)
             epoch_losses.append(avg_epoch_loss)
-            # tqdm.write(f"Epoch {epoch+1}/{epochs} - Avg Loss: {avg_epoch_loss:.6f}")
 
     # Plot epoch losses
     fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
-    ax.plot(range(1, epochs + 1), epoch_losses, marker='o', linestyle='-', label='Training Loss')
+    ax.plot(
+        range(1, epochs + 1), epoch_losses, marker='o', linestyle='-', label='Training Loss'
+    )
     ax.set_title(f"Training Loss for Model: {model_name}")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Average MSE Loss")
@@ -742,14 +1117,17 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
         ax.set_xticks(range(1, epochs + 1))
     fig.tight_layout()
 
-    # Save loss chart using safe filename logic
+    # Save loss chart
     try:
+        # Try to save relative to the script file
         save_dir = Path(__file__).parent / "saved" / "models"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        safe_filename = make_safe_filename(model_name, suffix="loss_chart") + ".png"
-        fig.savefig(save_dir / safe_filename)
-    except Exception as e:
-        debug_error(f"Failed to save loss chart: {e}")
+    except NameError:
+        # Fallback for environments like notebooks
+        save_dir = Path.cwd() / "saved" / "models"
+        
+    save_dir.mkdir(parents=True, exist_ok=True)
+    safe_filename = make_safe_filename(model_name, suffix="loss_chart") + ".png"
+    fig.savefig(save_dir / safe_filename)
 
     plt.show()
     plt.close(fig)
@@ -761,36 +1139,60 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
 # --- NEW MERGED ABSTRACTION FINDER ---
 # ==============================================================================
 
-def find_abstractions(structures, 
-                      method='ae', 
-                      structure_type="PATTERNS", 
-                      min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
-                      retrain_iterations=RETRAIN_ITERATIONS, 
-                      error_threshold=ERROR_THRESHOLD, 
-                      epochs=EPOCHS, 
-                      lr=LEARNING_RATE):
-    """
-    Finds abstractions using either an Autoencoder ('ae') or PCA ('pca').
+def find_abstractions(
+    structures,
+    method='ae',
+    structure_type="PATTERNS",
+    min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
+    retrain_iterations=RETRAIN_ITERATIONS,
+    error_threshold=ERROR_THRESHOLD,
+    epochs=EPOCHS,
+    lr=LEARNING_RATE
+):
+    """Find abstractions for DSL patterns using either Autoencoder or PCA.
 
-    This function is the main entry point for training abstraction models.
-    It handles data normalization, model creation, training/fitting, and
-    iterative retraining based on reconstruction error.
-    
-    Args:
-        structures (dict): Mapping pattern names to parameter lists.
-        method (str, optional): The abstraction method to use: 'ae' or 'pca'.
-        structure_type (str, optional): Type description for logging.
-        min_examples (int, optional): Minimum examples to train a model.
-        retrain_iterations (int, optional): Number of retraining passes.
-        error_threshold (float, optional): Maximum reconstruction error allowed.
-        epochs (int, optional): Training epochs (used by 'ae' only).
-        lr (float, optional): Learning rate (used by 'ae' only).
+    This is the main *training* function. It iterates through all
+    patterns ("structures") and trains a compression model (AE or PCA)
+    for each one that has enough examples.
 
-    Returns:
-        dict: Trained models (Autoencoder or PCAModel) keyed by pattern name.
+    It handles:
+    -   Calculating normalization stats (mean/std) for each pattern.
+    -   Iterative retraining to filter out outliers.
+    -   Attaching the `data_mean_` and `data_std_` to the final
+        trained model for later use in normalization/un-normalization.
+
+    Parameters
+    ----------
+    structures : dict
+        A dictionary mapping pattern names (str) to lists of
+        parameter vectors (list[list[float]]).
+    method : str, optional
+        The abstraction method: 'ae' (Autoencoder) or 'pca' (PCA).
+        Defaults to 'ae'.
+    structure_type : str, optional
+        A descriptive name for the type of structures being processed
+        (e.g., "L1 PATTERNS"), used for logging.
+    min_examples : int, optional
+        Minimum examples needed to train a model.
+    retrain_iterations : int, optional
+        Number of iterative retraining passes.
+    error_threshold : float, optional
+        Reconstruction error threshold for filtering outliers.
+    epochs : int, optional
+        Number of training epochs (used by 'ae' only).
+    lr : float, optional
+        Learning rate (used by 'ae' only).
+
+    Returns
+    -------
+    dict
+        A dictionary mapping pattern names (str) to their successfully
+        trained models (Autoencoder or PCAModel).
     """
     trained_models = {}
-    sorted_structures = sorted(structures.items(), key=lambda item: len(item[1]), reverse=True)
+    sorted_structures = sorted(
+        structures.items(), key=lambda item: len(item[1]), reverse=True
+    )
     
     method_name = method.lower()
     if method_name not in ['ae', 'pca']:
@@ -807,7 +1209,7 @@ def find_abstractions(structures,
         params_tensor = t(torch.tensor(parameters, dtype=torch.float32))
         mask = torch.ones(len(parameters), dtype=torch.bool, device=DEVICE)
         
-        model = None # Define model in outer scope
+        model = None  # Define model in outer scope
         
         for iteration in range(retrain_iterations):
             current_params = params_tensor[mask]
@@ -816,15 +1218,15 @@ def find_abstractions(structures,
                 debug_info(f"No more data for {name} in iteration {iteration+1}.")
                 break
             
-            # 1. Calculate stats (mean/std)
+            # 1. Calculate stats (mean/std) on the *current* data subset
             data_mean = torch.mean(current_params, dim=0)
             data_std = torch.std(current_params, dim=0)
-            data_std[data_std == 0] = 1.0 # Prevent division by zero
+            data_std[data_std == 0] = 1.0  # Prevent division by zero
             
             # 2. Define the compressed dimension
             hidden_dim = max(1, num_params - 1)
             
-            # 3. Create, train, or fit the model based on the method
+            # 3. Create, train, or fit the model
             if method_name == 'pca':
                 # --- PCA FITTING ---
                 normalized_current_params = (current_params - data_mean) / data_std
@@ -833,25 +1235,37 @@ def find_abstractions(structures,
                 model.data_mean_ = data_mean.to(DEVICE)
                 model.data_std_ = data_std.to(DEVICE)
                 
-                debug_info(f"Fitting PCA for {name} (Iter {iteration+1}) on {len(normalized_current_params)} samples...")
+                debug_info(
+                    f"Fitting PCA for {name} (Iter {iteration+1}) on "
+                    f"{len(normalized_current_params)} samples..."
+                )
                 model.fit(normalized_current_params)
             
             elif method_name == 'ae':
                 # --- Autoencoder Training ---
-                dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
+                dataloader = prepare_autoencoder_train_data(
+                    parameters, mask, data_mean, data_std
+                )
                 if len(dataloader.dataset) == 0:
-                     debug_info(f"Empty dataloader for {name} in iteration {iteration+1}.")
-                     break
+                    debug_info(
+                        f"Empty dataloader for {name} in iteration {iteration+1}."
+                    )
+                    break
                 
                 model = Autoencoder(num_params, hidden_dim).to(DEVICE)
                 model.data_mean_ = data_mean.to(DEVICE)
                 model.data_std_ = data_std.to(DEVICE)
                 
-                model = train_autoencoder(model, dataloader, model_name=name, epochs=epochs, lr=lr)
+                model = train_autoencoder(
+                    model, dataloader, model_name=name, epochs=epochs, lr=lr
+                )
 
             # 4. Re-evaluate mask on *all* data using the new model's stats
             mask = is_well_explained(model, params_tensor, error_threshold)
-            debug_info(f"[{name} Iter {iteration+1}] Kept {mask.sum().item()}/{len(parameters)} examples.")
+            debug_info(
+                f"[{name} Iter {iteration+1}] "
+                f"Kept {mask.sum().item()}/{len(parameters)} examples."
+            )
 
         # Store the final model from the last iteration
         if model is not None and mask.any():
@@ -864,70 +1278,159 @@ def find_abstractions(structures,
 # --- FIXED INTEGRATION FUNCTION ---
 # ==============================================================================
 
-def integrate_abstractions(node, singleton_models, pair_models, error_threshold=ERROR_THRESHOLD, depth=0, detailed_debug=False):
-    """
-    Recursively abstracts a DSL tree with trained models.
-    *** UPDATED: All detailed logging is now behind the detailed_debug flag. ***
-    *** MODIFIED to normalize data before encoding and checking error. ***
-    *** MODIFIED to check model.input_dim for compatibility. ***
+def integrate_abstractions(
+    node,
+    singleton_models,
+    pair_models,
+    error_threshold=ERROR_THRESHOLD,
+    depth=0,
+    detailed_debug=False
+):
+    """Recursively abstract a DSL tree by replacing concrete patterns.
+
+    This is the main *application* function. It performs a post-order
+    traversal (bottom-up) of the DSL tree. At each node, it attempts
+    to match the node (and its immediate child) against the trained
+    `pair_models` and `singleton_models`.
+
+    If a match is found:
+    1.  It extracts the parameters.
+    2.  It normalizes them using the model's `data_mean_` and `data_std_`.
+    3.  It checks the reconstruction error.
+    4.  If error < `error_threshold`, it *encodes* the normalized
+        parameters to get a latent vector.
+    5.  It replaces the concrete node(s) with a new `Abstraction` node
+        containing the pattern name, latent vector, and model.
+
+    Parameters
+    ----------
+    node : object
+        The root node of the DSL tree to abstract.
+    singleton_models : dict
+        Dictionary of trained models for singleton patterns.
+    pair_models : dict
+        Dictionary of trained models for pair patterns.
+    error_threshold : float, optional
+        The max normalized error to allow for an abstraction.
+    depth : int, optional
+        Internal tracking of recursion depth for logging.
+    detailed_debug : bool, optional
+        If True, prints verbose step-by-step logging.
+
+    Returns
+    -------
+    object
+        The new root node of the (potentially) abstracted DSL tree.
     """
     indent = "  " * depth
     
-    # --- Always log entry ---
-    node_name_repr = f"Abs({node.pattern_name})" if isinstance(node, Abstraction) else type(node).__name__
+    node_name_repr = f"Abs({node.pattern_name})" if \
+                     isinstance(node, Abstraction) else type(node).__name__
     if detailed_debug: debug_info(f"{indent}[{depth}] Processing: {node_name_repr}")
 
     if isinstance(node, Abstraction):
-        if detailed_debug: debug_info(f"{indent}[{depth}] Node is already an Abstraction. Recursing on its {len(node.children)} children.")
+        # Node is already abstracted, just recurse on its children
+        if detailed_debug:
+            debug_info(
+                f"{indent}[{depth}] Node is already an Abstraction. "
+                f"Recursing on its {len(node.children)} children."
+            )
         rebuilt_children = [
-            integrate_abstractions(c, singleton_models, pair_models, error_threshold, depth + 1, detailed_debug)
+            integrate_abstractions(
+                c, singleton_models, pair_models,
+                error_threshold, depth + 1, detailed_debug
+            )
             for c in node.children
         ]
         node.children = rebuilt_children
-        if detailed_debug: debug_info(f"{indent}[{depth}] Returning existing Abstraction node: {node_name_repr}")
+        if detailed_debug:
+            debug_info(
+                f"{indent}[{depth}] Returning existing Abstraction node: "
+                f"{node_name_repr}"
+            )
         return node
     
     if not hasattr(node, "serialize"):
-        # --- Always log critical errors ---
-        debug_error(f"{indent}[{depth}] Node {type(node).__name__} has no 'serialize' method. Returning as-is.")
+        debug_error(
+            f"{indent}[{depth}] Node {type(node).__name__} has no 'serialize' "
+            f"method. Returning as-is."
+        )
         return node
         
     # --- RECURSIVE STEP ---
     _, (_, children) = node.serialize()
-    valid_children = [c for c in children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
-    if detailed_debug: debug_info(f"{indent}[{depth}] Recursing on {len(valid_children)} children for {node_name_repr}...")
-    rebuilt_children = [
-        integrate_abstractions(c, singleton_models, pair_models, error_threshold, depth + 1, detailed_debug)
-        if hasattr(c, "serialize") or isinstance(c, Abstraction) else c
-        for c in children
+    valid_children = [
+        c for c in children if
+        hasattr(c, "serialize") or isinstance(c, Abstraction)
     ]
-    if detailed_debug: debug_info(f"{indent}[{depth}] All children for {node_name_repr} processed.")
+    if detailed_debug:
+        debug_info(
+            f"{indent}[{depth}] Recursing on {len(valid_children)} "
+            f"children for {node_name_repr}..."
+        )
+    
+    rebuilt_children = []
+    for c in children:
+        if hasattr(c, "serialize") or isinstance(c, Abstraction):
+            rebuilt_children.append(
+                integrate_abstractions(
+                    c, singleton_models, pair_models,
+                    error_threshold, depth + 1, detailed_debug
+                )
+            )
+        else:
+            rebuilt_children.append(c)
+
+    if detailed_debug:
+        debug_info(f"{indent}[{depth}] All children for {node_name_repr} processed.")
 
     # --- REBUILD ---
+    # Rebuild the current node with its new (potentially abstracted) children
     current_node = None
     try:
-        # Rebuild logic... (same as before)
         if isinstance(node, Union):
             current_node = Union(rebuilt_children[0], rebuilt_children[1])
         elif isinstance(node, SymRef):
-            current_node = SymRef(rebuilt_children[0], plane_normal=node.plane, point_on_plane=node.point_on_plane)
+            current_node = SymRef(
+                rebuilt_children[0],
+                plane_normal=node.plane,
+                point_on_plane=node.point_on_plane
+            )
         elif isinstance(node, SymRot):
-            current_node = SymRot(rebuilt_children[0], axis=node.axis, center=node.center, n_fold=node.n)
+            current_node = SymRot(
+                rebuilt_children[0],
+                axis=node.axis,
+                center=node.center,
+                n_fold=node.n
+            )
         elif isinstance(node, SymTrans):
-            current_node = SymTrans(rebuilt_children[0], end_point=node.end_point, n_fold=node.n)
+            current_node = SymTrans(
+                rebuilt_children[0], end_point=node.end_point, n_fold=node.n
+            )
         elif hasattr(node, "child"):
+            # For unary nodes: Scale, Rotate, Translate
             kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
             current_node = type(node)(rebuilt_children[0], **kwargs)
         else:
-            current_node = type(node)(*rebuilt_children) # Box
-        if detailed_debug: debug_info(f"{indent}[{depth}] Rebuilt {type(current_node).__name__} with new children.")
+            # For terminal nodes like Box
+            current_node = type(node)(*rebuilt_children)
+        if detailed_debug:
+            debug_info(
+                f"{indent}[{depth}] Rebuilt {type(current_node).__name__} "
+                f"with new children."
+            )
     except Exception as e:
-        # --- Always log critical errors ---
-        debug_error(f"{indent}[{depth}] FAILED to rebuild node {node_name_repr}: {e}. Returning original node.")
-        return node # Return the original node if rebuild fails
+        debug_error(
+            f"{indent}[{depth}] FAILED to rebuild node {node_name_repr}: {e}. "
+            f"Returning original node."
+        )
+        return node  # Return the original node if rebuild fails
 
     # --- PAIR ABSTRACTION ATTEMPT ---
-    child_nodes = [c for c in rebuilt_children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
+    child_nodes = [
+        c for c in rebuilt_children if
+        hasattr(c, "serialize") or isinstance(c, Abstraction)
+    ]
     
     if len(child_nodes) == 1:
         child_node = child_nodes[0]
@@ -935,7 +1438,7 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
         c_params = None
         c_children = []
 
-        # Logic to get child info... (same as before)
+        # Get child's name, params, and grandchildren
         if isinstance(child_node, Abstraction):
             child_name = f"Abs({child_node.pattern_name})"
             c_params = child_node.compressed_params
@@ -946,34 +1449,32 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
         
         if child_name:
             pair_sig = f"{type(current_node).__name__}({child_name})"
-            if detailed_debug: debug_info(f"{indent}[{depth}] -> Checking for PAIR abstraction: {pair_sig}")
+            if detailed_debug:
+                debug_info(
+                    f"{indent}[{depth}] -> Checking for PAIR abstraction: {pair_sig}"
+                )
             
             if pair_sig in pair_models:
-                if detailed_debug: debug_info(f"{indent}[{depth}]    Found model for {pair_sig}.")
+                if detailed_debug:
+                    debug_info(f"{indent}[{depth}]    Found model for {pair_sig}.")
                 model = pair_models[pair_sig]
                 p_params, _ = current_node.serialize()[1]
                 p_params_list = list(p_params or [])
                 c_params_list = list(c_params or [])
-                combined = t(torch.tensor(p_params_list + c_params_list, dtype=torch.float32)).unsqueeze(0)
+                combined = t(
+                    torch.tensor(p_params_list + c_params_list, dtype=torch.float32)
+                ).unsqueeze(0)
                 
                 if combined.shape[1] == 0:
-                    if detailed_debug: debug_info(f"{indent}[{depth}]    Skipping (no params to abstract).")
+                    if detailed_debug:
+                        debug_info(f"{indent}[{depth}]    Skipping (no params).")
                 
-                # ==========================================================
-                # --- START OF FIX 1 (PAIR) ---
-                # ==========================================================
                 elif combined.shape[1] != model.input_dim:
-                # ==========================================================
-                # --- END OF FIX 1 (PAIR) ---
-                # ==========================================================
-
-                    # --- Always log critical errors ---
-                    debug_error(f"{indent}[{depth}]    Shape mismatch for {pair_sig}: Model expects {model.input_dim}, got {combined.shape[1]}")
+                    debug_error(
+                        f"{indent}[{depth}]    Shape mismatch for {pair_sig}: "
+                        f"Model expects {model.input_dim}, got {combined.shape[1]}"
+                    )
                 else:
-                    # ==========================================================
-                    # --- START NORMALIZATION CHANGE (PAIR) ---
-                    # ==========================================================
-                    
                     # 1. Normalize the combined parameters
                     normalized_combined = (combined - model.data_mean_) / model.data_std_
                     
@@ -981,65 +1482,73 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
                     _, reconstruction = model(normalized_combined)
                     
                     # 3. Calculate error against normalized data
-                    error = torch.max(torch.abs(reconstruction - normalized_combined)).item()
+                    error = torch.max(
+                        torch.abs(reconstruction - normalized_combined)
+                    ).item()
                     
-                    # ========================================================
-                    # --- END NORMALIZATION CHANGE (PAIR) ---
-                    # ========================================================
-                    
-                    if detailed_debug: debug_info(f"{indent}[{depth}]    Reconstruction error: {error:.4f} (Threshold: {error_threshold})")
+                    if detailed_debug:
+                        debug_info(
+                            f"{indent}[{depth}]    Reconstruction error: {error:.4f} "
+                            f"(Threshold: {error_threshold})"
+                        )
                     
                     if error < error_threshold:
-                        # --- Log success only if detailed ---
-                        if detailed_debug: debug_success(f"{indent}[{depth}]    SUCCESS: Applying PAIR abstraction for {pair_sig}!")
-                        
-                        # ==========================================================
-                        # --- START NORMALIZATION CHANGE (PAIR ENCODING) ---
-                        # ==========================================================
+                        if detailed_debug:
+                            debug_success(
+                                f"{indent}[{depth}]    SUCCESS: Applying PAIR "
+                                f"abstraction for {pair_sig}!"
+                            )
                         
                         # 4. Encode the *normalized* data
                         encoding, _ = model(normalized_combined)
                         
-                        # ========================================================
-                        # --- END NORMALIZATION CHANGE (PAIR ENCODING) ---
-                        # ========================================================
-                        
-                        grandchildren = [c for c in c_children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
-                        if detailed_debug: debug_info(f"{indent}[{depth}] Returning NEW Abstraction node: {pair_sig}")
-                        return Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
+                        grandchildren = [
+                            c for c in c_children if
+                            hasattr(c, "serialize") or isinstance(c, Abstraction)
+                        ]
+                        if detailed_debug:
+                            debug_info(
+                                f"{indent}[{depth}] Returning NEW Abstraction node: "
+                                f"{pair_sig}"
+                            )
+                        return Abstraction(
+                            pair_sig,
+                            encoding.squeeze().tolist(),
+                            model,
+                            children=grandchildren
+                        )
             else:
-                 if detailed_debug: debug_info(f"{indent}[{depth}]    No model found for {pair_sig}.")
+                if detailed_debug:
+                    debug_info(f"{indent}[{depth}]    No model found for {pair_sig}.")
 
     # --- SINGLETON ABSTRACTION ATTEMPT ---
+    # (Only if pair abstraction failed or was not applicable)
     name = type(current_node).__name__
-    if detailed_debug: debug_info(f"{indent}[{depth}] -> Checking for SINGLETON abstraction: {name}")
+    if detailed_debug:
+        debug_info(f"{indent}[{depth}] -> Checking for SINGLETON abstraction: {name}")
     
     if name in singleton_models:
         if detailed_debug: debug_info(f"{indent}[{depth}]    Found model for {name}.")
-        model, (p_params, _) = singleton_models[name], current_node.serialize()[1]
+        model = singleton_models[name]
+        p_params, _ = current_node.serialize()[1]
         
         if not p_params:
-            if detailed_debug: debug_info(f"{indent}[{depth}]    Skipping (no params to abstract, e.g., Union).")
-            if detailed_debug: debug_info(f"{indent}[{depth}] Returning rebuilt node: {name}")
+            if detailed_debug:
+                debug_info(
+                    f"{indent}[{depth}]    Skipping (no params, e.g., Union)."
+                )
+            if detailed_debug:
+                debug_info(f"{indent}[{depth}] Returning rebuilt node: {name}")
             return current_node
             
         params_tensor = t(torch.tensor(p_params, dtype=torch.float32)).unsqueeze(0)
         
-        # ==========================================================
-        # --- START OF FIX 2 (SINGLETON) ---
-        # ==========================================================
         if params_tensor.shape[1] != model.input_dim:
-        # ==========================================================
-        # --- END OF FIX 2 (SINGLETON) ---
-        # ==========================================================
-
-            # --- Always log critical errors ---
-            debug_error(f"{indent}[{depth}]    Shape mismatch for {name}: Model expects {model.input_dim}, got {params_tensor.shape[1]}")
+            debug_error(
+                f"{indent}[{depth}]    Shape mismatch for {name}: "
+                f"Model expects {model.input_dim}, got {params_tensor.shape[1]}"
+            )
         else:
-            # ==========================================================
-            # --- START NORMALIZATION CHANGE (SINGLETON) ---
-            # ==========================================================
-            
             # 1. Normalize the parameters
             normalized_params = (params_tensor - model.data_mean_) / model.data_std_
             
@@ -1049,32 +1558,33 @@ def integrate_abstractions(node, singleton_models, pair_models, error_threshold=
             # 3. Calculate error against normalized data
             error = torch.max(torch.abs(reconstruction - normalized_params)).item()
             
-            # ========================================================
-            # --- END NORMALIZATION CHANGE (SINGLETON) ---
-            # ========================================================
-            
-            if detailed_debug: debug_info(f"{indent}[{depth}]    Reconstruction error: {error:.4f} (Threshold: {error_threshold})")
+            if detailed_debug:
+                debug_info(
+                    f"{indent}[{depth}]    Reconstruction error: {error:.4f} "
+                    f"(Threshold: {error_threshold})"
+                )
             
             if error < error_threshold:
-                # --- Log success only if detailed ---
-                if detailed_debug: debug_success(f"{indent}[{depth}]    SUCCESS: Applying SINGLETON abstraction for {name}!")
-                
-                # ==========================================================
-                # --- START NORMALIZATION CHANGE (SINGLETON ENCODING) ---
-                # ==========================================================
+                if detailed_debug:
+                    debug_success(
+                        f"{indent}[{depth}]    SUCCESS: Applying SINGLETON "
+                        f"abstraction for {name}!"
+                    )
                 
                 # 4. Encode the *normalized* data
                 encoding, _ = model(normalized_params)
                 
-                # ========================================================
-                # --- END NORMALIZATION CHANGE (SINGLETON ENCODING) ---
-                # ========================================================
-                
-                if detailed_debug: debug_info(f"{indent}[{depth}] Returning NEW Abstraction node: {name}")
-                return Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
+                if detailed_debug:
+                    debug_info(
+                        f"{indent}[{depth}] Returning NEW Abstraction node: {name}"
+                    )
+                return Abstraction(
+                    name, encoding.squeeze().tolist(), model, children=child_nodes
+                )
     else:
         if detailed_debug: debug_info(f"{indent}[{depth}]    No model found for {name}.")
 
     # --- EXIT (No Abstraction Applied) ---
-    if detailed_debug: debug_info(f"{indent}[{depth}] No abstraction applied. Returning rebuilt {name}.")
+    if detailed_debug:
+        debug_info(f"{indent}[{depth}] No abstraction applied. Returning rebuilt {name}.")
     return current_node

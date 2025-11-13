@@ -1,8 +1,15 @@
-"""
-plot_utils.py
+"""plot_utils.py
 
-Utilities for expanding DSL trees and visualizing them as 3D meshes using k3d,
-with robust debug logging.
+Utilities for expanding DSL trees and visualizing them as 3D meshes using k3d
+and Matplotlib, with robust debug logging.
+
+This module provides functions to:
+- Expand Domain-Specific Language (DSL) tree structures into their
+  constituent geometric primitives (boxes).
+- Visualize the resulting geometries as 3D meshes using `k3d` for
+  interactive plots.
+- Visualize the resulting geometries using `matplotlib` for static images.
+- Generate grid plots and base64-encoded images for Dash applications.
 """
 
 import base64
@@ -16,7 +23,8 @@ from abstractionssymh.debug_utils import debug_info, debug_error, debug_success
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-# Color map for part labels
+# --- Module-level Constants ---
+
 LABEL_COLORS = {
     0: 0xFF0000,  # red    (Backrest)
     1: 0x00FF00,  # green  (Seat)
@@ -24,17 +32,25 @@ LABEL_COLORS = {
     3: 0xFFFF00,  # yellow (Armrest)
     -1: 0x808080,  # gray   (Unknown)
 }
+"""dict: Color map for part labels, mapping integer IDs to hex color codes."""
 
+
+# --- Functions ---
 
 def expand_dsl_tree(node):
     """Expands a DSL tree node into its final geometry.
 
-    Args:
-        node: A DSL tree node object that must implement an ``expand()`` method.
+    Parameters
+    ----------
+    node : object
+        A DSL tree node object that must implement an ``expand()`` method.
 
-    Returns:
-        list: A list of box dictionaries containing geometry and label
-        information. Returns an empty list if expansion fails.
+    Returns
+    -------
+    list[dict]
+        A list of box dictionaries, each containing geometry (center,
+        lengths, quaternion) and label information. Returns an empty
+        list if expansion fails.
     """
     try:
         return node.expand()
@@ -44,13 +60,18 @@ def expand_dsl_tree(node):
 
 
 def plot_dsl_with_k3d(dsl_root_node, save_path=None):
-    """
-    Expands and visualizes a DSL tree as a 3D mesh using k3d.
-    Optionally saves the interactive scene as an HTML file.
+    """Visualize a DSL tree as a 3D mesh using k3d.
 
-    Args:
-        dsl_root_node: The root DSL node of the tree.
-        save_path (str or Path, optional): If provided, saves the k3d scene as an HTML file.
+    Expands the tree and renders it as an interactive 3D plot in
+    a Jupyter environment or saves it as a standalone HTML file.
+
+    Parameters
+    ----------
+    dsl_root_node : object
+        The root DSL node of the tree to visualize.
+    save_path : str or pathlib.Path, optional
+        If provided, saves the k3d scene as an interactive HTML file
+        at this location. If None (default), displays the plot inline.
     """
     debug_info("Expanding DSL tree for visualization...")
     final_boxes = expand_dsl_tree(dsl_root_node)
@@ -130,7 +151,18 @@ def plot_dsl_with_k3d(dsl_root_node, save_path=None):
 
 
 def hex_to_rgb_normalized(hex_color):
-    """Converts a hex integer to a normalized RGB tuple."""
+    """Convert a hex integer to a normalized (0.0-1.0) RGB tuple.
+
+    Parameters
+    ----------
+    hex_color : int
+        The color as a 24-bit integer (e.g., 0xFF0000).
+
+    Returns
+    -------
+    tuple[float, float, float]
+        A tuple (r, g, b) with values ranging from 0.0 to 1.0.
+    """
     r = ((hex_color >> 16) & 0xFF) / 255.0
     g = ((hex_color >> 8) & 0xFF) / 255.0
     b = (hex_color & 0xFF) / 255.0
@@ -140,9 +172,23 @@ def hex_to_rgb_normalized(hex_color):
 def plot_dsl_with_matplotlib(
     dsl_root_node, save_path=None, figsize=(8, 8), axis_limits=(-1, 1)
 ):
-    """
-    Expands and visualizes a DSL tree as a 3D mesh using matplotlib.
+    """Visualize a DSL tree as a 3D mesh using Matplotlib.
+
+    Expands the tree and renders it as a static 3D plot.
     Optionally saves the plot as a PNG file.
+
+    Parameters
+    ----------
+    dsl_root_node : object
+        The root DSL node of the tree to visualize.
+    save_path : str or pathlib.Path, optional
+        If provided, saves the plot as a PNG file at this location.
+        If None (default), displays the plot using ``plt.show()``.
+    figsize : tuple[int, int], optional
+        The figure size (width, height) in inches. Default is (8, 8).
+    axis_limits : tuple[float, float], optional
+        The (min, max) limits for the X, Y, and Z axes.
+        Default is (-1, 1).
     """
     debug_info("Expanding DSL tree for visualization...")
     final_boxes = expand_dsl_tree(dsl_root_node)
@@ -218,13 +264,30 @@ def plot_dsl_with_matplotlib(
     else:
         plt.show()
         debug_success("3D plot displayed successfully.")
-    
+
     plt.close(fig)
 
+
 def plot_dsl_with_matplotlib_dash(dsl_root_node, axis_limits=(-1, 1)):
-    """
-    Generates a Matplotlib 3D plot from a DSL object and returns a base64 PNG
-    string ready for Dash display in html.Img.
+    """Generate a Matplotlib 3D plot as a base64 string for Dash.
+
+    Renders a DSL object to a Matplotlib figure, saves it to an
+    in-memory buffer, and returns it as a base64-encoded PNG string
+    suitable for embedding in a Dash ``html.Img`` component.
+
+    Parameters
+    ----------
+    dsl_root_node : object
+        The root DSL node of the tree to visualize.
+    axis_limits : tuple[float, float], optional
+        The (min, max) limits for the X, Y, and Z axes.
+        Default is (-1, 1).
+
+    Returns
+    -------
+    str or None
+        A base64-encoded PNG data URI (e.g., "data:image/png;base64,...").
+        Returns None if the DSL tree expansion fails.
     """
 
     # Expand DSL tree to get final boxes
@@ -242,18 +305,22 @@ def plot_dsl_with_matplotlib_dash(dsl_root_node, axis_limits=(-1, 1)):
         label_id = box.get("label_id", -1)
 
         rotation_matrix = Rotation.from_quat(quaternion).as_matrix()
-        d1, d2, d3 = [col * length / 2 for col, length in zip(rotation_matrix.T, lengths)]
+        d1, d2, d3 = [
+            col * length / 2 for col, length in zip(rotation_matrix.T, lengths)
+        ]
 
-        corners = np.array([
-            center - d1 - d2 - d3,
-            center + d1 - d2 - d3,
-            center + d1 + d2 - d3,
-            center - d1 + d2 - d3,
-            center - d1 - d2 + d3,
-            center + d1 - d2 + d3,
-            center + d1 + d2 + d3,
-            center - d1 + d2 + d3,
-        ])
+        corners = np.array(
+            [
+                center - d1 - d2 - d3,
+                center + d1 - d2 - d3,
+                center + d1 + d2 - d3,
+                center - d1 + d2 - d3,
+                center - d1 - d2 + d3,
+                center + d1 - d2 + d3,
+                center + d1 + d2 + d3,
+                center - d1 + d2 + d3,
+            ]
+        )
 
         faces_indices = [
             [corners[0], corners[1], corners[2], corners[3]],  # Bottom
@@ -266,7 +333,9 @@ def plot_dsl_with_matplotlib_dash(dsl_root_node, axis_limits=(-1, 1)):
 
         hex_color = LABEL_COLORS.get(label_id, LABEL_COLORS[-1])
         color = hex_to_rgb_normalized(hex_color)
-        collection = Poly3DCollection(faces_indices, facecolors=color, edgecolors="k", linewidths=0.3, alpha=0.8)
+        collection = Poly3DCollection(
+            faces_indices, facecolors=color, edgecolors="k", linewidths=0.3, alpha=0.8
+        )
         ax.add_collection3d(collection)
 
     ax.set_xlim(axis_limits)
@@ -280,24 +349,48 @@ def plot_dsl_with_matplotlib_dash(dsl_root_node, axis_limits=(-1, 1)):
 
     # Save to in-memory buffer and encode as base64
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=150)
+    fig.savefig(buf, format="png", dpi=150)
     plt.close(fig)
     buf.seek(0)
-    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    img_base64 = base64.b64encode(buf.read()).decode("utf-8")
     return f"data:image/png;base64,{img_base64}"
 
-def plot_dsl_grid(dsl_objects, names, save_path=None, grid_cols=3, figsize_per_plot=(6, 6), axis_limits=(-0.8, 0.8), grid_title=""):
-    """
-    Renders a list of DSL objects on a matplotlib grid that auto-sizes.
 
-    Args:
-        dsl_objects (list): A list of the DSL root nodes to plot.
-        names (list): A list of strings, providing a title for each plot.
-        save_path (str or Path, optional): Path to save the entire grid as a single PNG.
-        grid_cols (int): The number of columns to use for the grid layout.
-        figsize_per_plot (tuple): The (width, height) for each individual subplot.
-        axis_limits (tuple): The min and max limits for all axes.
-        grid_title (str): An overall title for the entire grid image.
+def plot_dsl_grid(
+    dsl_objects,
+    names,
+    save_path=None,
+    grid_cols=3,
+    figsize_per_plot=(6, 6),
+    axis_limits=(-0.8, 0.8),
+    grid_title="",
+):
+    """Render a grid of DSL objects using Matplotlib.
+
+    Generates a single image containing a grid of 3D plots, one for
+    each provided DSL object. The grid layout is determined
+    automatically based on the number of objects and `grid_cols`.
+
+    Parameters
+    ----------
+    dsl_objects : list[object]
+        A list of the DSL root nodes to plot.
+    names : list[str]
+        A list of strings, providing a title for each subplot.
+        Must be the same length as `dsl_objects`.
+    save_path : str or pathlib.Path, optional
+        Path to save the entire grid as a single PNG. If None
+        (default), displays the plot using ``plt.show()``.
+    grid_cols : int, optional
+        The number of columns to use for the grid layout. Default is 3.
+    figsize_per_plot : tuple[int, int], optional
+        The (width, height) in inches for each individual subplot.
+        Default is (6, 6).
+    axis_limits : tuple[float, float], optional
+        The (min, max) limits for all axes in all subplots.
+        Default is (-0.8, 0.8).
+    grid_title : str, optional
+        An overall title for the entire grid image. Default is "".
     """
     if len(dsl_objects) != len(names):
         debug_error("Error: The number of DSL objects must match the number of names.")
@@ -311,44 +404,68 @@ def plot_dsl_grid(dsl_objects, names, save_path=None, grid_cols=3, figsize_per_p
     num_rows = math.ceil(num_plots / grid_cols)
     total_figsize = (grid_cols * figsize_per_plot[0], num_rows * figsize_per_plot[1])
 
-    fig, axes = plt.subplots(num_rows, grid_cols, figsize=total_figsize,
-                             subplot_kw={'projection': '3d'}, squeeze=False)
+    fig, axes = plt.subplots(
+        num_rows,
+        grid_cols,
+        figsize=total_figsize,
+        subplot_kw={"projection": "3d"},
+        squeeze=False,
+    )
 
     axes_flat = axes.flatten()
 
     for i, dsl_root_node in enumerate(dsl_objects):
         ax = axes_flat[i]
         title = names[i]
-        
+
         final_boxes = expand_dsl_tree(dsl_root_node)
         if not final_boxes:
             ax.set_title(f"{title}\n(No boxes found)", fontsize=10)
             continue
 
         for box in final_boxes:
-            center = np.array(box.get("center", [0,0,0]), dtype=float)
-            lengths = np.asarray(box.get("lengths", [1,1,1]), dtype=float).ravel()
-            quaternion = box.get("quaternion", [0,0,0,1])
+            center = np.array(box.get("center", [0, 0, 0]), dtype=float)
+            lengths = np.asarray(box.get("lengths", [1, 1, 1]), dtype=float).ravel()
+            quaternion = box.get("quaternion", [0, 0, 0, 1])
             label_id = box.get("label_id", -1)
 
             rotation_matrix = Rotation.from_quat(quaternion).as_matrix()
-            d1, d2, d3 = [col * length / 2 for col, length in zip(rotation_matrix.T, lengths)]
-            
-            corners = np.array([
-                center - d1 - d2 - d3, center + d1 - d2 - d3, center + d1 + d2 - d3, center - d1 + d2 - d3,
-                center - d1 - d2 + d3, center + d1 - d2 + d3, center + d1 + d2 + d3, center - d1 + d2 + d3
-            ])
-            
-            faces_indices = [
-                [corners[0], corners[1], corners[2], corners[3]], [corners[4], corners[5], corners[6], corners[7]],
-                [corners[0], corners[1], corners[5], corners[4]], [corners[2], corners[3], corners[7], corners[6]],
-                [corners[0], corners[3], corners[7], corners[4]], [corners[1], corners[2], corners[6], corners[5]]
+            d1, d2, d3 = [
+                col * length / 2 for col, length in zip(rotation_matrix.T, lengths)
             ]
-            
+
+            corners = np.array(
+                [
+                    center - d1 - d2 - d3,
+                    center + d1 - d2 - d3,
+                    center + d1 + d2 - d3,
+                    center - d1 + d2 - d3,
+                    center - d1 - d2 + d3,
+                    center + d1 - d2 + d3,
+                    center + d1 + d2 + d3,
+                    center - d1 + d2 + d3,
+                ]
+            )
+
+            faces_indices = [
+                [corners[0], corners[1], corners[2], corners[3]],
+                [corners[4], corners[5], corners[6], corners[7]],
+                [corners[0], corners[1], corners[5], corners[4]],
+                [corners[2], corners[3], corners[7], corners[6]],
+                [corners[0], corners[3], corners[7], corners[4]],
+                [corners[1], corners[2], corners[6], corners[5]],
+            ]
+
             hex_color = LABEL_COLORS.get(label_id, LABEL_COLORS.get(-1))
             color = hex_to_rgb_normalized(hex_color)
-            
-            collection = Poly3DCollection(faces_indices, facecolors=color, edgecolors="k", linewidths=0.2, alpha=0.85)
+
+            collection = Poly3DCollection(
+                faces_indices,
+                facecolors=color,
+                edgecolors="k",
+                linewidths=0.2,
+                alpha=0.85,
+            )
             ax.add_collection3d(collection)
 
         ax.set_title(title, fontsize=10)
@@ -356,16 +473,18 @@ def plot_dsl_grid(dsl_objects, names, save_path=None, grid_cols=3, figsize_per_p
         ax.set_ylim(axis_limits)
         ax.set_zlim(axis_limits)
         ax.set_box_aspect([1, 1, 1])
-        ax.set_xlabel("X", fontsize=8); ax.set_ylabel("Y", fontsize=8); ax.set_zlabel("Z", fontsize=8)
+        ax.set_xlabel("X", fontsize=8)
+        ax.set_ylabel("Y", fontsize=8)
+        ax.set_zlabel("Z", fontsize=8)
 
     for i in range(num_plots, len(axes_flat)):
         axes_flat[i].set_axis_off()
 
     # --- NEW: Add a suptitle for the entire grid ---
     if grid_title:
-        fig.suptitle(grid_title, fontsize=16, y=0.98) # y adjusts position
-        
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95], pad=2.0) # Adjust layout to make space for suptitle
+        fig.suptitle(grid_title, fontsize=16, y=0.98)  # y adjusts position
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95], pad=2.0)  # Adjust layout
 
     if save_path:
         save_path = Path(save_path)
@@ -375,5 +494,5 @@ def plot_dsl_grid(dsl_objects, names, save_path=None, grid_cols=3, figsize_per_p
     else:
         plt.show()
         debug_success("Grid plot displayed successfully.")
-    
+
     plt.close(fig)
