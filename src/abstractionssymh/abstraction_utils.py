@@ -64,8 +64,8 @@ class Autoencoder(nn.Module):
             hidden_dim (int): Dimension of latent space.
         """
         super().__init__()
-        self.input_dim = input_dim  # <--- ADD THIS LINE
-        self.hidden_dim = hidden_dim # <--- ADD THIS LINE
+        self.input_dim = input_dim  # <--- ADDED THIS LINE
+        self.hidden_dim = hidden_dim # <--- ADDED THIS LINE
         debug_info(f"Initializing Autoencoder: input_dim={input_dim}, hidden_dim={hidden_dim}")
 
         self.encoder = nn.Sequential(
@@ -96,9 +96,7 @@ class Autoencoder(nn.Module):
         latent = self.encoder(x)
         decoded = self.decoder(latent)
         return latent, decoded
-    
-# === In: abstraction_utils.py ===
-# (Place this after the Autoencoder class)
+
 
 class PCAModel(nn.Module):
     """
@@ -117,7 +115,7 @@ class PCAModel(nn.Module):
         # state and moves with .to(DEVICE), but is not a trainable parameter.
         self.register_buffer('components', torch.randn(input_dim, hidden_dim))
         
-        # These will be attached by the find_abstractions_pca function
+        # These will be attached by the find_abstractions function
         self.data_mean_ = None
         self.data_std_ = None
 
@@ -759,96 +757,46 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
     return model
 
 
-def find_abstractions(structures, structure_type="PATTERNS", min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
-                      retrain_iterations=RETRAIN_ITERATIONS, error_threshold=ERROR_THRESHOLD, epochs=EPOCHS):
-    """Trains autoencoders for each structure type and returns models.
-    *** MODIFIED to calculate and store normalization stats (mean/std) on the model. ***
+# ==============================================================================
+# --- NEW MERGED ABSTRACTION FINDER ---
+# ==============================================================================
 
+def find_abstractions(structures, 
+                      method='ae', 
+                      structure_type="PATTERNS", 
+                      min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
+                      retrain_iterations=RETRAIN_ITERATIONS, 
+                      error_threshold=ERROR_THRESHOLD, 
+                      epochs=EPOCHS, 
+                      lr=LEARNING_RATE):
+    """
+    Finds abstractions using either an Autoencoder ('ae') or PCA ('pca').
+
+    This function is the main entry point for training abstraction models.
+    It handles data normalization, model creation, training/fitting, and
+    iterative retraining based on reconstruction error.
+    
     Args:
         structures (dict): Mapping pattern names to parameter lists.
+        method (str, optional): The abstraction method to use: 'ae' or 'pca'.
         structure_type (str, optional): Type description for logging.
         min_examples (int, optional): Minimum examples to train a model.
         retrain_iterations (int, optional): Number of retraining passes.
         error_threshold (float, optional): Maximum reconstruction error allowed.
-        epochs (int, optional): Training epochs.
+        epochs (int, optional): Training epochs (used by 'ae' only).
+        lr (float, optional): Learning rate (used by 'ae' only).
 
     Returns:
-        dict: Trained models (with .data_mean_ and .data_std_) keyed by pattern name.
-    """
-    trained_models = {}
-    sorted_structures = sorted(structures.items(), key=lambda item: len(item[1]), reverse=True)
-    for name, parameters in sorted_structures:
-        if len(parameters) < min_examples:
-            continue
-        num_params = len(parameters[0])
-        if num_params <= 1:
-            continue
-            
-        params_tensor = t(torch.tensor(parameters, dtype=torch.float32))
-        mask = torch.ones(len(parameters), dtype=torch.bool, device=DEVICE)
-        
-        model = None # Define model in outer scope
-
-        for iteration in range(retrain_iterations):
-            current_params = params_tensor[mask]
-            if not current_params.any():
-                debug_info(f"No more data for {name} in iteration {iteration+1}.")
-                break
-            
-            # 1. Calculate stats from the *current* subset of data
-            data_mean = torch.mean(current_params, dim=0)
-            data_std = torch.std(current_params, dim=0)
-            # Prevent division by zero for constant features
-            data_std[data_std == 0] = 1.0 
-            
-            # 2. Prepare dataloader with normalized data
-            dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
-            if len(dataloader.dataset) == 0:
-                 debug_info(f"Empty dataloader for {name} in iteration {iteration+1}.")
-                 break
-
-            # 3. Create model and attach stats
-            model = Autoencoder(num_params, max(1, num_params - 1)).to(DEVICE)
-            model.data_mean_ = data_mean.to(DEVICE)
-            model.data_std_ = data_std.to(DEVICE)
-            
-            # 4. Train
-            model = train_autoencoder(model, dataloader, model_name=name, epochs=epochs)
-            
-            # 5. Re-evaluate mask on *all* data using the new model
-            # is_well_explained will use the stats stored on the model
-            mask = is_well_explained(model, params_tensor, error_threshold)
-            
-            debug_info(f"[{name} Iter {iteration+1}] Kept {mask.sum().item()}/{len(parameters)} examples.")
-
-        # Store the final model from the last iteration
-        if model is not None and mask.any():
-            trained_models[name] = model
-            
-    return trained_models
-
-# === In: abstraction_utils.py ===
-# (Place this after the find_abstractions function)
-
-def find_abstractions_pca(structures, structure_type="PATTERNS", min_examples=MIN_EXAMPLES_FOR_ABSTRACTION,
-                          retrain_iterations=RETRAIN_ITERATIONS, error_threshold=ERROR_THRESHOLD):
-    """
-    Finds abstractions using PCA, as a drop-in for find_abstractions.
-    It "trains" by fitting PCA components.
-    
-    Args:
-        structures (dict): Mapping pattern names to parameter lists.
-        structure_type (str, optional): Type description for logging.
-        min_examples (int, optional): Minimum examples to train a model.
-        retrain_iterations (int, optional): Number of retraining passes.
-        error_threshold (float, optional): Maximum reconstruction error allowed.
-
-    Returns:
-        dict: Trained PCAModels (with .data_mean_ and .data_std_) keyed by pattern name.
+        dict: Trained models (Autoencoder or PCAModel) keyed by pattern name.
     """
     trained_models = {}
     sorted_structures = sorted(structures.items(), key=lambda item: len(item[1]), reverse=True)
     
+    method_name = method.lower()
+    if method_name not in ['ae', 'pca']:
+        debug_error(f"Unknown method '{method}'. Defaulting to 'ae'.")
+        method_name = 'ae'
+
     for name, parameters in sorted_structures:
         if len(parameters) < min_examples:
             continue
@@ -871,27 +819,38 @@ def find_abstractions_pca(structures, structure_type="PATTERNS", min_examples=MI
             # 1. Calculate stats (mean/std)
             data_mean = torch.mean(current_params, dim=0)
             data_std = torch.std(current_params, dim=0)
-            # Prevent division by zero for constant features
-            data_std[data_std == 0] = 1.0 
+            data_std[data_std == 0] = 1.0 # Prevent division by zero
             
-            # 2. Normalize the current data subset
-            normalized_current_params = (current_params - data_mean) / data_std
+            # 2. Define the compressed dimension
+            hidden_dim = max(1, num_params - 1)
             
-            # 3. Create PCA model and attach stats
-            # This is your "drop 1 axis" logic
-            hidden_dim = max(1, num_params - 1) 
-            model = PCAModel(num_params, hidden_dim).to(DEVICE)
-            model.data_mean_ = data_mean.to(DEVICE)
-            model.data_std_ = data_std.to(DEVICE)
+            # 3. Create, train, or fit the model based on the method
+            if method_name == 'pca':
+                # --- PCA FITTING ---
+                normalized_current_params = (current_params - data_mean) / data_std
+                
+                model = PCAModel(num_params, hidden_dim).to(DEVICE)
+                model.data_mean_ = data_mean.to(DEVICE)
+                model.data_std_ = data_std.to(DEVICE)
+                
+                debug_info(f"Fitting PCA for {name} (Iter {iteration+1}) on {len(normalized_current_params)} samples...")
+                model.fit(normalized_current_params)
             
-            # 4. "Train" (fit) the PCA model on the normalized data
-            debug_info(f"Fitting PCA for {name} (Iter {iteration+1}) on {len(normalized_current_params)} samples...")
-            model.fit(normalized_current_params)
-            
-            # 5. Re-evaluate mask on *all* data using the new model's stats
-            # is_well_explained will use the .data_mean_ and .data_std_
+            elif method_name == 'ae':
+                # --- Autoencoder Training ---
+                dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
+                if len(dataloader.dataset) == 0:
+                     debug_info(f"Empty dataloader for {name} in iteration {iteration+1}.")
+                     break
+                
+                model = Autoencoder(num_params, hidden_dim).to(DEVICE)
+                model.data_mean_ = data_mean.to(DEVICE)
+                model.data_std_ = data_std.to(DEVICE)
+                
+                model = train_autoencoder(model, dataloader, model_name=name, epochs=epochs, lr=lr)
+
+            # 4. Re-evaluate mask on *all* data using the new model's stats
             mask = is_well_explained(model, params_tensor, error_threshold)
-            
             debug_info(f"[{name} Iter {iteration+1}] Kept {mask.sum().item()}/{len(parameters)} examples.")
 
         # Store the final model from the last iteration
@@ -900,6 +859,10 @@ def find_abstractions_pca(structures, structure_type="PATTERNS", min_examples=MI
             
     return trained_models
 
+
+# ==============================================================================
+# --- FIXED INTEGRATION FUNCTION ---
+# ==============================================================================
 
 def integrate_abstractions(node, singleton_models, pair_models, error_threshold=ERROR_THRESHOLD, depth=0, detailed_debug=False):
     """
