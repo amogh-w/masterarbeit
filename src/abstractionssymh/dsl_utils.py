@@ -69,7 +69,6 @@ def find_all_subtrees(node):
 
 
 def collect_singleton_and_pair_data(dsl_shapes):
-    debug_error("bruh")
     """Collect singleton and parent-child pair parameter data from DSL shapes.
 
     This function iterates through a list of DSL root nodes, traverses

@@ -1017,7 +1017,7 @@ def is_well_explained(
         error, _ = torch.max(torch.abs(reconstructions - normalized_input), dim=-1)
         
     well_explained = error < error_threshold
-    return well_explained
+    return well_explained, error
 
 
 def make_safe_filename(name: str, suffix: str = "") -> str:
@@ -1046,7 +1046,14 @@ def make_safe_filename(name: str, suffix: str = "") -> str:
     return safe
 
 
-def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE):
+def train_autoencoder(
+    model, 
+    dataloader, 
+    model_name, 
+    epochs=EPOCHS, 
+    lr=LEARNING_RATE,
+    save_dir=None  # <-- NEW PARAMETER
+):
     """Train an autoencoder, showing progress and plotting loss.
 
     Parameters
@@ -1062,7 +1069,10 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
         Number of epochs to train.
     lr : float, optional
         Learning rate for the optimizer.
-
+    save_dir : str or Path, optional
+        The directory to save the loss chart PNG. If None,
+        the chart is only displayed.
+    
     Returns
     -------
     Autoencoder
@@ -1117,23 +1127,23 @@ def train_autoencoder(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_
         ax.set_xticks(range(1, epochs + 1))
     fig.tight_layout()
 
-    # Save loss chart
-    try:
-        # Try to save relative to the script file
-        save_dir = Path(__file__).parent / "saved" / "models"
-    except NameError:
-        # Fallback for environments like notebooks
-        save_dir = Path.cwd() / "saved" / "models"
-        
-    save_dir.mkdir(parents=True, exist_ok=True)
-    safe_filename = make_safe_filename(model_name, suffix="loss_chart") + ".png"
-    fig.savefig(save_dir / safe_filename)
+    # --- MODIFIED SAVE LOGIC ---
+    # Save loss chart if a directory is provided
+    if save_dir:
+        try:
+            save_path = Path(save_dir)
+            save_path.mkdir(parents=True, exist_ok=True)
+            safe_filename = make_safe_filename(model_name, suffix="loss_chart") + ".png"
+            fig.savefig(save_path / safe_filename)
+            debug_success(f"Saved loss chart to {save_path / safe_filename}")
+        except Exception as e:
+            debug_error(f"Failed to save loss chart for {model_name} to {save_dir}: {e}")
+    # --- END MODIFIED LOGIC ---
 
     plt.show()
     plt.close(fig)
 
     return model
-
 
 # ==============================================================================
 # --- NEW MERGED ABSTRACTION FINDER ---
@@ -1147,7 +1157,9 @@ def find_abstractions(
     retrain_iterations=RETRAIN_ITERATIONS,
     error_threshold=ERROR_THRESHOLD,
     epochs=EPOCHS,
-    lr=LEARNING_RATE
+    lr=LEARNING_RATE,
+    save_dir=None,  # <-- NEW PARAMETER
+    plot_error_distribution=False
 ):
     """Find abstractions for DSL patterns using either Autoencoder or PCA.
 
@@ -1189,88 +1201,204 @@ def find_abstractions(
         A dictionary mapping pattern names (str) to their successfully
         trained models (Autoencoder or PCAModel).
     """
+    debug_info(f"Starting abstraction search for {len(structures)} {structure_type}...")
     trained_models = {}
+
+    # Sort by frequency
     sorted_structures = sorted(
         structures.items(), key=lambda item: len(item[1]), reverse=True
     )
-    
+    debug_info("Structures sorted by sample count (descending).")
+
     method_name = method.lower()
     if method_name not in ['ae', 'pca']:
         debug_error(f"Unknown method '{method}'. Defaulting to 'ae'.")
         method_name = 'ae'
+    else:
+        debug_info(f"Using abstraction method: {method_name.upper()}")
 
+    # ----------------------------------------------------------------------
+    # MAIN LOOP: per-structure training
+    # ----------------------------------------------------------------------
     for name, parameters in sorted_structures:
+        debug_info(f"\n--- Processing pattern '{name}' ({len(parameters)} samples) ---")
+
+        # Skip small patterns
         if len(parameters) < min_examples:
+            debug_info(f"Skipping '{name}': only {len(parameters)} examples (< {min_examples}).")
             continue
+
         num_params = len(parameters[0])
         if num_params <= 1:
+            debug_info(f"Skipping '{name}': only 1 parameter dimension.")
             continue
-            
+
+        debug_info(f"Parameter dimension for '{name}': {num_params}")
+
+        # Tensor preparation
         params_tensor = t(torch.tensor(parameters, dtype=torch.float32))
+        debug_info(f"Loaded tensor for '{name}' with shape {params_tensor.shape}")
+
         mask = torch.ones(len(parameters), dtype=torch.bool, device=DEVICE)
-        
-        model = None  # Define model in outer scope
-        
+        model = None
+
+        # ------------------------------------------------------------------
+        # ITERATIVE RE-TRAINING LOOP
+        # ------------------------------------------------------------------
         for iteration in range(retrain_iterations):
+
+            debug_info(f"-- Iteration {iteration+1} for '{name}' --")
+            debug_info(f"Current mask keeps {mask.sum().item()} / {len(mask)} samples.")
+
             current_params = params_tensor[mask]
-            
+
             if not current_params.any() or len(current_params) < 2:
-                debug_info(f"No more data for {name} in iteration {iteration+1}.")
+                debug_info(f"No more valid data for '{name}' in iteration {iteration+1}. Breaking.")
                 break
-            
-            # 1. Calculate stats (mean/std) on the *current* data subset
+
+            # ---- Compute normalization stats ----
             data_mean = torch.mean(current_params, dim=0)
             data_std = torch.std(current_params, dim=0)
-            data_std[data_std == 0] = 1.0  # Prevent division by zero
-            
-            # 2. Define the compressed dimension
+            data_std[data_std == 0] = 1.0
+
+            debug_info(f"{name} Mean: {data_mean.tolist()}")
+            debug_info(f"{name} Std: {data_std.tolist()}")
+
+            # ---- Hidden dimension decision ----
             hidden_dim = max(1, num_params - 1)
-            
-            # 3. Create, train, or fit the model
+            debug_info(f"Hidden dimension for '{name}': {hidden_dim}")
+
+            # ------------------------------------------------------------------
+            # PCA METHOD
+            # ------------------------------------------------------------------
             if method_name == 'pca':
-                # --- PCA FITTING ---
+                debug_info(f"Initializing PCA model for '{name}'...")
+
                 normalized_current_params = (current_params - data_mean) / data_std
-                
+
                 model = PCAModel(num_params, hidden_dim).to(DEVICE)
                 model.data_mean_ = data_mean.to(DEVICE)
                 model.data_std_ = data_std.to(DEVICE)
-                
+
                 debug_info(
-                    f"Fitting PCA for {name} (Iter {iteration+1}) on "
-                    f"{len(normalized_current_params)} samples..."
+                    f"Fitting PCA for '{name}' (iteration {iteration+1}) "
+                    f"on {len(normalized_current_params)} normalized samples..."
                 )
+
                 model.fit(normalized_current_params)
-            
+
+                debug_info(f"PCA training complete for '{name}'.")
+
+            # ------------------------------------------------------------------
+            # AUTOENCODER METHOD
+            # ------------------------------------------------------------------
             elif method_name == 'ae':
-                # --- Autoencoder Training ---
+                debug_info(f"Preparing Autoencoder training data for '{name}'...")
+
                 dataloader = prepare_autoencoder_train_data(
                     parameters, mask, data_mean, data_std
                 )
-                if len(dataloader.dataset) == 0:
-                    debug_info(
-                        f"Empty dataloader for {name} in iteration {iteration+1}."
-                    )
-                    break
                 
+                if len(dataloader.dataset) == 0:
+                    debug_info(f"Dataloader empty for '{name}' in iteration {iteration+1}. Breaking.")
+                    break
+
+                debug_info(f"Training AE for '{name}' with {len(dataloader.dataset)} samples.")
+
                 model = Autoencoder(num_params, hidden_dim).to(DEVICE)
                 model.data_mean_ = data_mean.to(DEVICE)
                 model.data_std_ = data_std.to(DEVICE)
-                
-                model = train_autoencoder(
-                    model, dataloader, model_name=name, epochs=epochs, lr=lr
-                )
 
-            # 4. Re-evaluate mask on *all* data using the new model's stats
-            mask = is_well_explained(model, params_tensor, error_threshold)
+                model = train_autoencoder(
+                    model, dataloader, model_name=name, epochs=epochs, lr=lr, save_dir=save_dir
+                )
+                debug_info(f"AE training complete for '{name}'.")
+
+            # ------------------------------------------------------------------
+            # RE-EVALUATE MASK (OUTLIER FILTERING)
+            # ------------------------------------------------------------------
+            debug_info(f"Recomputing mask for '{name}' using error threshold {error_threshold}...")
+            mask, errors = is_well_explained(model, params_tensor, error_threshold)
+
             debug_info(
-                f"[{name} Iter {iteration+1}] "
-                f"Kept {mask.sum().item()}/{len(parameters)} examples."
+                f"[{name} Iter {iteration+1}] Kept "
+                f"{mask.sum().item()}/{len(parameters)} examples."
             )
 
-        # Store the final model from the last iteration
-        if model is not None and mask.any():
-            trained_models[name] = model
-            
+            # --- NEW PLOTTING LOGIC ---
+            if plot_error_distribution:
+                errors_np = errors.cpu().numpy()
+                
+                fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
+                # Plot histogram of all errors
+                ax.hist(
+                    errors_np, 
+                    bins=50, 
+                    alpha=0.7, 
+                    label='All Sample Errors'
+                )
+                
+                # Plot histogram of errors *below* the threshold (the ones we keep)
+                # ax.hist(
+                #     errors_np[mask.cpu().numpy()], 
+                #     bins=25, 
+                #     alpha=0.9, 
+                #     label=f'Kept (Error < {error_threshold})'
+                # )
+                
+                # Draw the threshold line
+                ax.axvline(
+                    error_threshold, 
+                    color='red', 
+                    linestyle='--', 
+                    linewidth=2, 
+                    label=f'Error Threshold ({error_threshold})'
+                )
+                
+                ax.set_title(
+                    f'"{name}" - Error Distribution (Iter {iteration+1})'
+                )
+                ax.set_xlabel("Max Reconstruction Error (Normalized Space)")
+                ax.set_ylabel("Sample Count")
+                ax.legend()
+                ax.grid(True, linestyle='--', alpha=0.5)
+                fig.tight_layout()
+
+                # --- NEW SAVE LOGIC ---
+                if save_dir:
+                    try:
+                        save_path = Path(save_dir)
+                        save_path.mkdir(parents=True, exist_ok=True)
+                        # Include iteration in filename
+                        safe_filename = make_safe_filename(
+                            name, suffix=f"error_iter_{iteration+1}"
+                        ) + ".png"
+                        fig.savefig(save_path / safe_filename)
+                        debug_success(f"Saved error plot to {save_path / safe_filename}")
+                    except Exception as e:
+                        debug_error(f"Failed to save error plot for {name}: {e}")
+                # --- END NEW SAVE LOGIC ---
+
+                plt.show()
+                plt.close(fig)
+                
+            # --- END NEW PLOTTING LOGIC ---
+
+        # ----------------------------------------------------------------------
+        # STORE FINAL MODEL
+        # ----------------------------------------------------------------------
+        if model is None:
+            debug_error(f"No model produced for '{name}'. Skipping.")
+            continue
+
+        if not mask.any():
+            debug_error(f"All samples rejected for '{name}'. Not storing model.")
+            continue
+
+        trained_models[name] = model
+        debug_success(f"Stored final model for '{name}'.")
+
+    debug_success(f"Finished abstraction search. Created {len(trained_models)} models.")
     return trained_models
 
 
@@ -1278,13 +1406,17 @@ def find_abstractions(
 # --- FIXED INTEGRATION FUNCTION ---
 # ==============================================================================
 
+def debug_abstraction(msg):
+    debug_success(f"[ABSTRACT] {msg}")
+
+
 def integrate_abstractions(
     node,
     singleton_models,
     pair_models,
     error_threshold=ERROR_THRESHOLD,
     depth=0,
-    detailed_debug=False
+    detailed_debug=False  # Added verbosity control flag
 ):
     """Recursively abstract a DSL tree by replacing concrete patterns.
 
@@ -1315,7 +1447,7 @@ def integrate_abstractions(
     depth : int, optional
         Internal tracking of recursion depth for logging.
     detailed_debug : bool, optional
-        If True, prints verbose step-by-step logging.
+        If True, prints verbose step-by-step logging. (Default: False)
 
     Returns
     -------
@@ -1323,70 +1455,64 @@ def integrate_abstractions(
         The new root node of the (potentially) abstracted DSL tree.
     """
     indent = "  " * depth
-    
-    node_name_repr = f"Abs({node.pattern_name})" if \
-                     isinstance(node, Abstraction) else type(node).__name__
-    if detailed_debug: debug_info(f"{indent}[{depth}] Processing: {node_name_repr}")
+    node_name = f"Abs({node.pattern_name})" if isinstance(node, Abstraction) else type(node).__name__
 
+    if detailed_debug:
+        debug_info(f"{indent}[{depth}] Processing: {node_name}")
+
+    # ------------------------------------------------------------------
+    # ALREADY ABSTRACTED
+    # ------------------------------------------------------------------
     if isinstance(node, Abstraction):
-        # Node is already abstracted, just recurse on its children
         if detailed_debug:
-            debug_info(
-                f"{indent}[{depth}] Node is already an Abstraction. "
-                f"Recursing on its {len(node.children)} children."
-            )
-        rebuilt_children = [
-            integrate_abstractions(
-                c, singleton_models, pair_models,
-                error_threshold, depth + 1, detailed_debug
-            )
+            debug_info(f"{indent}[{depth}] Already abstracted; recursing into children.")
+        node.children = [
+            integrate_abstractions(c, singleton_models, pair_models,
+                                   error_threshold, depth+1, detailed_debug)
             for c in node.children
         ]
-        node.children = rebuilt_children
-        if detailed_debug:
-            debug_info(
-                f"{indent}[{depth}] Returning existing Abstraction node: "
-                f"{node_name_repr}"
-            )
         return node
-    
+
+    # ------------------------------------------------------------------
+    # NODE WITHOUT serialize()
+    # ------------------------------------------------------------------
     if not hasattr(node, "serialize"):
-        debug_error(
-            f"{indent}[{depth}] Node {type(node).__name__} has no 'serialize' "
-            f"method. Returning as-is."
-        )
+        if detailed_debug:
+            debug_error(f"{indent}[{depth}] Node {type(node).__name__} lacks serialize().")
         return node
-        
-    # --- RECURSIVE STEP ---
-    _, (_, children) = node.serialize()
+
+    # ------------------------------------------------------------------
+    # RECURSE
+    # ------------------------------------------------------------------
+    try:
+        _, (_, children) = node.serialize()
+    except Exception as e:
+        if detailed_debug:
+            debug_error(f"{indent}[{depth}] Failed to serialize {node_name}: {e}")
+        return node
+
     valid_children = [
-        c for c in children if
-        hasattr(c, "serialize") or isinstance(c, Abstraction)
+        c for c in children if hasattr(c, "serialize") or isinstance(c, Abstraction)
     ]
     if detailed_debug:
-        debug_info(
-            f"{indent}[{depth}] Recursing on {len(valid_children)} "
-            f"children for {node_name_repr}..."
-        )
-    
+        debug_info(f"{indent}[{depth}] Recursing into {len(valid_children)} children.")
+
     rebuilt_children = []
     for c in children:
         if hasattr(c, "serialize") or isinstance(c, Abstraction):
             rebuilt_children.append(
-                integrate_abstractions(
-                    c, singleton_models, pair_models,
-                    error_threshold, depth + 1, detailed_debug
-                )
+                integrate_abstractions(c, singleton_models, pair_models,
+                                       error_threshold, depth+1, detailed_debug)
             )
         else:
             rebuilt_children.append(c)
 
     if detailed_debug:
-        debug_info(f"{indent}[{depth}] All children for {node_name_repr} processed.")
+        debug_info(f"{indent}[{depth}] Finished children for {node_name}")
 
-    # --- REBUILD ---
-    # Rebuild the current node with its new (potentially abstracted) children
-    current_node = None
+    # ------------------------------------------------------------------
+    # REBUILD ORIGINAL NODE
+    # ------------------------------------------------------------------
     try:
         if isinstance(node, Union):
             current_node = Union(rebuilt_children[0], rebuilt_children[1])
@@ -1408,183 +1534,111 @@ def integrate_abstractions(
                 rebuilt_children[0], end_point=node.end_point, n_fold=node.n
             )
         elif hasattr(node, "child"):
-            # For unary nodes: Scale, Rotate, Translate
             kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
             current_node = type(node)(rebuilt_children[0], **kwargs)
         else:
-            # For terminal nodes like Box
             current_node = type(node)(*rebuilt_children)
+
         if detailed_debug:
-            debug_info(
-                f"{indent}[{depth}] Rebuilt {type(current_node).__name__} "
-                f"with new children."
-            )
+            debug_info(f"{indent}[{depth}] Rebuilt node {type(current_node).__name__}")
     except Exception as e:
-        debug_error(
-            f"{indent}[{depth}] FAILED to rebuild node {node_name_repr}: {e}. "
-            f"Returning original node."
-        )
-        return node  # Return the original node if rebuild fails
+        if detailed_debug:
+            debug_error(f"{indent}[{depth}] Failed rebuild: {e}")
+        return node
 
-    # --- PAIR ABSTRACTION ATTEMPT ---
+    # ------------------------------------------------------------------
+    # PAIR ABSTRACTION ATTEMPT
+    # ------------------------------------------------------------------
     child_nodes = [
-        c for c in rebuilt_children if
-        hasattr(c, "serialize") or isinstance(c, Abstraction)
+        c for c in rebuilt_children if hasattr(c, "serialize") or isinstance(c, Abstraction)
     ]
-    
+
     if len(child_nodes) == 1:
-        child_node = child_nodes[0]
-        child_name = ""
-        c_params = None
-        c_children = []
+        child = child_nodes[0]
 
-        # Get child's name, params, and grandchildren
-        if isinstance(child_node, Abstraction):
-            child_name = f"Abs({child_node.pattern_name})"
-            c_params = child_node.compressed_params
-            c_children = child_node.children
-        elif hasattr(child_node, "serialize"):
-            child_name = type(child_node).__name__
-            c_params, c_children = child_node.serialize()[1]
-        
-        if child_name:
-            pair_sig = f"{type(current_node).__name__}({child_name})"
-            if detailed_debug:
-                debug_info(
-                    f"{indent}[{depth}] -> Checking for PAIR abstraction: {pair_sig}"
-                )
-            
-            if pair_sig in pair_models:
-                if detailed_debug:
-                    debug_info(f"{indent}[{depth}]    Found model for {pair_sig}.")
-                model = pair_models[pair_sig]
-                p_params, _ = current_node.serialize()[1]
-                p_params_list = list(p_params or [])
-                c_params_list = list(c_params or [])
-                combined = t(
-                    torch.tensor(p_params_list + c_params_list, dtype=torch.float32)
-                ).unsqueeze(0)
-                
-                if combined.shape[1] == 0:
-                    if detailed_debug:
-                        debug_info(f"{indent}[{depth}]    Skipping (no params).")
-                
-                elif combined.shape[1] != model.input_dim:
-                    debug_error(
-                        f"{indent}[{depth}]    Shape mismatch for {pair_sig}: "
-                        f"Model expects {model.input_dim}, got {combined.shape[1]}"
-                    )
-                else:
-                    # 1. Normalize the combined parameters
-                    normalized_combined = (combined - model.data_mean_) / model.data_std_
-                    
-                    # 2. Get reconstruction of normalized data
-                    _, reconstruction = model(normalized_combined)
-                    
-                    # 3. Calculate error against normalized data
-                    error = torch.max(
-                        torch.abs(reconstruction - normalized_combined)
-                    ).item()
-                    
-                    if detailed_debug:
-                        debug_info(
-                            f"{indent}[{depth}]    Reconstruction error: {error:.4f} "
-                            f"(Threshold: {error_threshold})"
-                        )
-                    
-                    if error < error_threshold:
-                        if detailed_debug:
-                            debug_success(
-                                f"{indent}[{depth}]    SUCCESS: Applying PAIR "
-                                f"abstraction for {pair_sig}!"
-                            )
-                        
-                        # 4. Encode the *normalized* data
-                        encoding, _ = model(normalized_combined)
-                        
-                        grandchildren = [
-                            c for c in c_children if
-                            hasattr(c, "serialize") or isinstance(c, Abstraction)
-                        ]
-                        if detailed_debug:
-                            debug_info(
-                                f"{indent}[{depth}] Returning NEW Abstraction node: "
-                                f"{pair_sig}"
-                            )
-                        return Abstraction(
-                            pair_sig,
-                            encoding.squeeze().tolist(),
-                            model,
-                            children=grandchildren
-                        )
-            else:
-                if detailed_debug:
-                    debug_info(f"{indent}[{depth}]    No model found for {pair_sig}.")
-
-    # --- SINGLETON ABSTRACTION ATTEMPT ---
-    # (Only if pair abstraction failed or was not applicable)
-    name = type(current_node).__name__
-    if detailed_debug:
-        debug_info(f"{indent}[{depth}] -> Checking for SINGLETON abstraction: {name}")
-    
-    if name in singleton_models:
-        if detailed_debug: debug_info(f"{indent}[{depth}]    Found model for {name}.")
-        model = singleton_models[name]
-        p_params, _ = current_node.serialize()[1]
-        
-        if not p_params:
-            if detailed_debug:
-                debug_info(
-                    f"{indent}[{depth}]    Skipping (no params, e.g., Union)."
-                )
-            if detailed_debug:
-                debug_info(f"{indent}[{depth}] Returning rebuilt node: {name}")
-            return current_node
-            
-        params_tensor = t(torch.tensor(p_params, dtype=torch.float32)).unsqueeze(0)
-        
-        if params_tensor.shape[1] != model.input_dim:
-            debug_error(
-                f"{indent}[{depth}]    Shape mismatch for {name}: "
-                f"Model expects {model.input_dim}, got {params_tensor.shape[1]}"
-            )
+        if isinstance(child, Abstraction):
+            child_name = f"Abs({child.pattern_name})"
+            child_params = child.compressed_params
+            grandchildren = child.children
         else:
-            # 1. Normalize the parameters
-            normalized_params = (params_tensor - model.data_mean_) / model.data_std_
-            
-            # 2. Get reconstruction of normalized data
-            _, reconstruction = model(normalized_params)
-            
-            # 3. Calculate error against normalized data
-            error = torch.max(torch.abs(reconstruction - normalized_params)).item()
-            
-            if detailed_debug:
-                debug_info(
-                    f"{indent}[{depth}]    Reconstruction error: {error:.4f} "
-                    f"(Threshold: {error_threshold})"
-                )
-            
-            if error < error_threshold:
-                if detailed_debug:
-                    debug_success(
-                        f"{indent}[{depth}]    SUCCESS: Applying SINGLETON "
-                        f"abstraction for {name}!"
-                    )
-                
-                # 4. Encode the *normalized* data
-                encoding, _ = model(normalized_params)
-                
-                if detailed_debug:
-                    debug_info(
-                        f"{indent}[{depth}] Returning NEW Abstraction node: {name}"
-                    )
-                return Abstraction(
-                    name, encoding.squeeze().tolist(), model, children=child_nodes
-                )
-    else:
-        if detailed_debug: debug_info(f"{indent}[{depth}]    No model found for {name}.")
+            child_name = type(child).__name__
+            child_params, gc_raw = child.serialize()[1]
+            grandchildren = [
+                gc for gc in gc_raw if hasattr(gc, "serialize") or isinstance(gc, Abstraction)
+            ]
 
-    # --- EXIT (No Abstraction Applied) ---
+        pair_sig = f"{type(current_node).__name__}({child_name})"
+
+        if pair_sig in pair_models:
+            if detailed_debug:
+                debug_info(f"{indent}[{depth}] Checking PAIR: {pair_sig}")
+
+            model = pair_models[pair_sig]
+            p_params, _ = current_node.serialize()[1]
+
+            combined = t(torch.tensor(
+                list(p_params or []) + list(child_params or []),
+                dtype=torch.float32
+            )).unsqueeze(0)
+
+            if combined.shape[1] == model.input_dim:
+                normalized = (combined - model.data_mean_) / model.data_std_
+                _, recon = model(normalized)
+                error = torch.max(torch.abs(recon - normalized)).item()
+
+                if detailed_debug:
+                    debug_info(f"{indent}[{depth}] Pair error {error:.4f}")
+
+                if error < error_threshold:
+                    if detailed_debug:
+                        debug_abstraction(f"Applied PAIR: {pair_sig}")
+
+                    encoding, _ = model(normalized)
+
+                    return Abstraction(
+                        pair_sig,
+                        encoding.squeeze().tolist(),
+                        model,
+                        children=grandchildren
+                    )
+
+    # ------------------------------------------------------------------
+    # SINGLETON ABSTRACTION
+    # ------------------------------------------------------------------
+    name = type(current_node).__name__
+    if name in singleton_models:
+        if detailed_debug:
+            debug_info(f"{indent}[{depth}] Checking SINGLETON: {name}")
+
+        model = singleton_models[name]
+        params, _ = current_node.serialize()[1]
+
+        if params:
+            params_tensor = t(torch.tensor(params, dtype=torch.float32)).unsqueeze(0)
+
+            if params_tensor.shape[1] == model.input_dim:
+                normalized = (params_tensor - model.data_mean_) / model.data_std_
+                _, recon = model(normalized)
+                error = torch.max(torch.abs(recon - normalized)).item()
+
+                if detailed_debug:
+                    debug_info(f"{indent}[{depth}] Singleton error {error:.4f}")
+
+                if error < error_threshold:
+                    if detailed_debug:
+                        debug_abstraction(f"Applied SINGLETON: {name}")
+
+                    encoding, _ = model(normalized)
+                    return Abstraction(
+                        name,
+                        encoding.squeeze().tolist(),
+                        model,
+                        children=child_nodes
+                    )
+
+    # ------------------------------------------------------------------
+    # NO ABSTRACTION
+    # ------------------------------------------------------------------
     if detailed_debug:
-        debug_info(f"{indent}[{depth}] No abstraction applied. Returning rebuilt {name}.")
+        debug_info(f"{indent}[{depth}] No abstraction applied.")
     return current_node
