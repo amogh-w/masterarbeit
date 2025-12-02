@@ -1415,45 +1415,23 @@ def integrate_abstractions(
     singleton_models,
     pair_models,
     error_threshold=ERROR_THRESHOLD,
+    geometric_threshold=0.05,  # <--- NEW: Geometric threshold (default 5cm if units=m)
+    points_per_check=50,       # <--- NEW: Low point count for speed
     depth=0,
-    detailed_debug=False  # Added verbosity control flag
+    detailed_debug=False
 ):
-    """Recursively abstract a DSL tree by replacing concrete patterns.
+    """Recursively abstract a DSL tree using both Parameter and Geometric metrics.
 
-    This is the main *application* function. It performs a post-order
-    traversal (bottom-up) of the DSL tree. At each node, it attempts
-    to match the node (and its immediate child) against the trained
-    `pair_models` and `singleton_models`.
-
-    If a match is found:
-    1.  It extracts the parameters.
-    2.  It normalizes them using the model's `data_mean_` and `data_std_`.
-    3.  It checks the reconstruction error.
-    4.  If error < `error_threshold`, it *encodes* the normalized
-        parameters to get a latent vector.
-    5.  It replaces the concrete node(s) with a new `Abstraction` node
-        containing the pattern name, latent vector, and model.
-
-    Parameters
-    ----------
-    node : object
-        The root node of the DSL tree to abstract.
-    singleton_models : dict
-        Dictionary of trained models for singleton patterns.
-    pair_models : dict
-        Dictionary of trained models for pair patterns.
-    error_threshold : float, optional
-        The max normalized error to allow for an abstraction.
-    depth : int, optional
-        Internal tracking of recursion depth for logging.
-    detailed_debug : bool, optional
-        If True, prints verbose step-by-step logging. (Default: False)
-
-    Returns
-    -------
-    object
-        The new root node of the (potentially) abstracted DSL tree.
+    1. Checks Parametric MSE (Fast).
+    2. If passed, checks Geometric Chamfer Distance (Slow but accurate).
     """
+    # --- Local Imports to avoid circular dependencies ---
+    from abstractionssymh.abstraction_compare_utils import (
+        get_point_cloud_from_dsl, 
+        calculate_chamfer_distance
+    )
+    from abstractionssymh.abstraction_utils import Abstraction, t, debug_abstraction
+
     indent = "  " * depth
     node_name = f"Abs({node.pattern_name})" if isinstance(node, Abstraction) else type(node).__name__
 
@@ -1468,7 +1446,7 @@ def integrate_abstractions(
             debug_info(f"{indent}[{depth}] Already abstracted; recursing into children.")
         node.children = [
             integrate_abstractions(c, singleton_models, pair_models,
-                                   error_threshold, depth+1, detailed_debug)
+                                   error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug)
             for c in node.children
         ]
         return node
@@ -1482,7 +1460,7 @@ def integrate_abstractions(
         return node
 
     # ------------------------------------------------------------------
-    # RECURSE
+    # RECURSE (Bottom-Up)
     # ------------------------------------------------------------------
     try:
         _, (_, children) = node.serialize()
@@ -1502,7 +1480,7 @@ def integrate_abstractions(
         if hasattr(c, "serialize") or isinstance(c, Abstraction):
             rebuilt_children.append(
                 integrate_abstractions(c, singleton_models, pair_models,
-                                       error_threshold, depth+1, detailed_debug)
+                                       error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug)
             )
         else:
             rebuilt_children.append(c)
@@ -1546,6 +1524,32 @@ def integrate_abstractions(
             debug_error(f"{indent}[{depth}] Failed rebuild: {e}")
         return node
 
+    # --- HELPER: Geometric Verification ---
+    def check_geometric_fidelity(original_node, candidate_abstraction):
+        """Returns True if the abstraction geometrically resembles the original."""
+        try:
+            # Generate Local Point Clouds (relative to this node's frame)
+            pc_orig = get_point_cloud_from_dsl(original_node, points_per_box=points_per_check)
+            pc_cand = get_point_cloud_from_dsl(candidate_abstraction, points_per_box=points_per_check)
+            
+            # If either is empty, fail safely (unless both are empty, which implies match)
+            if len(pc_orig) == 0 and len(pc_cand) == 0: return True
+            if len(pc_orig) == 0 or len(pc_cand) == 0: return False
+
+            # Calculate Chamfer
+            dist = calculate_chamfer_distance(pc_orig, pc_cand)
+            
+            if detailed_debug:
+                if dist > geometric_threshold:
+                    debug_info(f"{indent}[GEO REJECT] Chamfer {dist:.4f} > {geometric_threshold}")
+                else:
+                    debug_info(f"{indent}[GEO PASS] Chamfer {dist:.4f} <= {geometric_threshold}")
+            
+            return dist <= geometric_threshold
+        except Exception as e:
+            if detailed_debug: debug_error(f"Geometry check failed: {e}")
+            return False
+
     # ------------------------------------------------------------------
     # PAIR ABSTRACTION ATTEMPT
     # ------------------------------------------------------------------
@@ -1584,26 +1588,30 @@ def integrate_abstractions(
             if combined.shape[1] == model.input_dim:
                 normalized = (combined - model.data_mean_) / model.data_std_
                 _, recon = model(normalized)
-                error = torch.max(torch.abs(recon - normalized)).item()
+                param_error = torch.max(torch.abs(recon - normalized)).item()
 
                 if detailed_debug:
-                    debug_info(f"{indent}[{depth}] Pair error {error:.4f}")
+                    debug_info(f"{indent}[{depth}] Pair error {param_error:.4f}")
 
-                if error < error_threshold:
-                    if detailed_debug:
-                        debug_abstraction(f"Applied PAIR: {pair_sig}")
-
+                # 1. FAST CHECK: Parameter Error
+                if param_error < error_threshold:
                     encoding, _ = model(normalized)
-
-                    return Abstraction(
+                    
+                    # Create Candidate
+                    candidate = Abstraction(
                         pair_sig,
                         encoding.squeeze().tolist(),
                         model,
                         children=grandchildren
                     )
+                    
+                    # 2. SLOW CHECK: Geometric Fidelity
+                    if check_geometric_fidelity(current_node, candidate):
+                        if detailed_debug: debug_abstraction(f"Applied PAIR: {pair_sig}")
+                        return candidate
 
     # ------------------------------------------------------------------
-    # SINGLETON ABSTRACTION
+    # SINGLETON ABSTRACTION ATTEMPT
     # ------------------------------------------------------------------
     name = type(current_node).__name__
     if name in singleton_models:
@@ -1619,22 +1627,27 @@ def integrate_abstractions(
             if params_tensor.shape[1] == model.input_dim:
                 normalized = (params_tensor - model.data_mean_) / model.data_std_
                 _, recon = model(normalized)
-                error = torch.max(torch.abs(recon - normalized)).item()
+                param_error = torch.max(torch.abs(recon - normalized)).item()
 
                 if detailed_debug:
-                    debug_info(f"{indent}[{depth}] Singleton error {error:.4f}")
+                    debug_info(f"{indent}[{depth}] Singleton error {param_error:.4f}")
 
-                if error < error_threshold:
-                    if detailed_debug:
-                        debug_abstraction(f"Applied SINGLETON: {name}")
-
+                # 1. FAST CHECK
+                if param_error < error_threshold:
                     encoding, _ = model(normalized)
-                    return Abstraction(
+                    
+                    # Create Candidate
+                    candidate = Abstraction(
                         name,
                         encoding.squeeze().tolist(),
                         model,
                         children=child_nodes
                     )
+                    
+                    # 2. SLOW CHECK
+                    if check_geometric_fidelity(current_node, candidate):
+                        if detailed_debug: debug_abstraction(f"Applied SINGLETON: {name}")
+                        return candidate
 
     # ------------------------------------------------------------------
     # NO ABSTRACTION
@@ -1642,3 +1655,236 @@ def integrate_abstractions(
     if detailed_debug:
         debug_info(f"{indent}[{depth}] No abstraction applied.")
     return current_node
+
+# def integrate_abstractions(
+#     node,
+#     singleton_models,
+#     pair_models,
+#     error_threshold=ERROR_THRESHOLD,
+#     depth=0,
+#     detailed_debug=False  # Added verbosity control flag
+# ):
+#     """Recursively abstract a DSL tree by replacing concrete patterns.
+
+#     This is the main *application* function. It performs a post-order
+#     traversal (bottom-up) of the DSL tree. At each node, it attempts
+#     to match the node (and its immediate child) against the trained
+#     `pair_models` and `singleton_models`.
+
+#     If a match is found:
+#     1.  It extracts the parameters.
+#     2.  It normalizes them using the model's `data_mean_` and `data_std_`.
+#     3.  It checks the reconstruction error.
+#     4.  If error < `error_threshold`, it *encodes* the normalized
+#         parameters to get a latent vector.
+#     5.  It replaces the concrete node(s) with a new `Abstraction` node
+#         containing the pattern name, latent vector, and model.
+
+#     Parameters
+#     ----------
+#     node : object
+#         The root node of the DSL tree to abstract.
+#     singleton_models : dict
+#         Dictionary of trained models for singleton patterns.
+#     pair_models : dict
+#         Dictionary of trained models for pair patterns.
+#     error_threshold : float, optional
+#         The max normalized error to allow for an abstraction.
+#     depth : int, optional
+#         Internal tracking of recursion depth for logging.
+#     detailed_debug : bool, optional
+#         If True, prints verbose step-by-step logging. (Default: False)
+
+#     Returns
+#     -------
+#     object
+#         The new root node of the (potentially) abstracted DSL tree.
+#     """
+#     indent = "  " * depth
+#     node_name = f"Abs({node.pattern_name})" if isinstance(node, Abstraction) else type(node).__name__
+
+#     if detailed_debug:
+#         debug_info(f"{indent}[{depth}] Processing: {node_name}")
+
+#     # ------------------------------------------------------------------
+#     # ALREADY ABSTRACTED
+#     # ------------------------------------------------------------------
+#     if isinstance(node, Abstraction):
+#         if detailed_debug:
+#             debug_info(f"{indent}[{depth}] Already abstracted; recursing into children.")
+#         node.children = [
+#             integrate_abstractions(c, singleton_models, pair_models,
+#                                    error_threshold, depth+1, detailed_debug)
+#             for c in node.children
+#         ]
+#         return node
+
+#     # ------------------------------------------------------------------
+#     # NODE WITHOUT serialize()
+#     # ------------------------------------------------------------------
+#     if not hasattr(node, "serialize"):
+#         if detailed_debug:
+#             debug_error(f"{indent}[{depth}] Node {type(node).__name__} lacks serialize().")
+#         return node
+
+#     # ------------------------------------------------------------------
+#     # RECURSE
+#     # ------------------------------------------------------------------
+#     try:
+#         _, (_, children) = node.serialize()
+#     except Exception as e:
+#         if detailed_debug:
+#             debug_error(f"{indent}[{depth}] Failed to serialize {node_name}: {e}")
+#         return node
+
+#     valid_children = [
+#         c for c in children if hasattr(c, "serialize") or isinstance(c, Abstraction)
+#     ]
+#     if detailed_debug:
+#         debug_info(f"{indent}[{depth}] Recursing into {len(valid_children)} children.")
+
+#     rebuilt_children = []
+#     for c in children:
+#         if hasattr(c, "serialize") or isinstance(c, Abstraction):
+#             rebuilt_children.append(
+#                 integrate_abstractions(c, singleton_models, pair_models,
+#                                        error_threshold, depth+1, detailed_debug)
+#             )
+#         else:
+#             rebuilt_children.append(c)
+
+#     if detailed_debug:
+#         debug_info(f"{indent}[{depth}] Finished children for {node_name}")
+
+#     # ------------------------------------------------------------------
+#     # REBUILD ORIGINAL NODE
+#     # ------------------------------------------------------------------
+#     try:
+#         if isinstance(node, Union):
+#             current_node = Union(rebuilt_children[0], rebuilt_children[1])
+#         elif isinstance(node, SymRef):
+#             current_node = SymRef(
+#                 rebuilt_children[0],
+#                 plane_normal=node.plane,
+#                 point_on_plane=node.point_on_plane
+#             )
+#         elif isinstance(node, SymRot):
+#             current_node = SymRot(
+#                 rebuilt_children[0],
+#                 axis=node.axis,
+#                 center=node.center,
+#                 n_fold=node.n
+#             )
+#         elif isinstance(node, SymTrans):
+#             current_node = SymTrans(
+#                 rebuilt_children[0], end_point=node.end_point, n_fold=node.n
+#             )
+#         elif hasattr(node, "child"):
+#             kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
+#             current_node = type(node)(rebuilt_children[0], **kwargs)
+#         else:
+#             current_node = type(node)(*rebuilt_children)
+
+#         if detailed_debug:
+#             debug_info(f"{indent}[{depth}] Rebuilt node {type(current_node).__name__}")
+#     except Exception as e:
+#         if detailed_debug:
+#             debug_error(f"{indent}[{depth}] Failed rebuild: {e}")
+#         return node
+
+#     # ------------------------------------------------------------------
+#     # PAIR ABSTRACTION ATTEMPT
+#     # ------------------------------------------------------------------
+#     child_nodes = [
+#         c for c in rebuilt_children if hasattr(c, "serialize") or isinstance(c, Abstraction)
+#     ]
+
+#     if len(child_nodes) == 1:
+#         child = child_nodes[0]
+
+#         if isinstance(child, Abstraction):
+#             child_name = f"Abs({child.pattern_name})"
+#             child_params = child.compressed_params
+#             grandchildren = child.children
+#         else:
+#             child_name = type(child).__name__
+#             child_params, gc_raw = child.serialize()[1]
+#             grandchildren = [
+#                 gc for gc in gc_raw if hasattr(gc, "serialize") or isinstance(gc, Abstraction)
+#             ]
+
+#         pair_sig = f"{type(current_node).__name__}({child_name})"
+
+#         if pair_sig in pair_models:
+#             if detailed_debug:
+#                 debug_info(f"{indent}[{depth}] Checking PAIR: {pair_sig}")
+
+#             model = pair_models[pair_sig]
+#             p_params, _ = current_node.serialize()[1]
+
+#             combined = t(torch.tensor(
+#                 list(p_params or []) + list(child_params or []),
+#                 dtype=torch.float32
+#             )).unsqueeze(0)
+
+#             if combined.shape[1] == model.input_dim:
+#                 normalized = (combined - model.data_mean_) / model.data_std_
+#                 _, recon = model(normalized)
+#                 error = torch.max(torch.abs(recon - normalized)).item()
+
+#                 if detailed_debug:
+#                     debug_info(f"{indent}[{depth}] Pair error {error:.4f}")
+
+#                 if error < error_threshold:
+#                     if detailed_debug:
+#                         debug_abstraction(f"Applied PAIR: {pair_sig}")
+
+#                     encoding, _ = model(normalized)
+
+#                     return Abstraction(
+#                         pair_sig,
+#                         encoding.squeeze().tolist(),
+#                         model,
+#                         children=grandchildren
+#                     )
+
+#     # ------------------------------------------------------------------
+#     # SINGLETON ABSTRACTION
+#     # ------------------------------------------------------------------
+#     name = type(current_node).__name__
+#     if name in singleton_models:
+#         if detailed_debug:
+#             debug_info(f"{indent}[{depth}] Checking SINGLETON: {name}")
+
+#         model = singleton_models[name]
+#         params, _ = current_node.serialize()[1]
+
+#         if params:
+#             params_tensor = t(torch.tensor(params, dtype=torch.float32)).unsqueeze(0)
+
+#             if params_tensor.shape[1] == model.input_dim:
+#                 normalized = (params_tensor - model.data_mean_) / model.data_std_
+#                 _, recon = model(normalized)
+#                 error = torch.max(torch.abs(recon - normalized)).item()
+
+#                 if detailed_debug:
+#                     debug_info(f"{indent}[{depth}] Singleton error {error:.4f}")
+
+#                 if error < error_threshold:
+#                     if detailed_debug:
+#                         debug_abstraction(f"Applied SINGLETON: {name}")
+
+#                     encoding, _ = model(normalized)
+#                     return Abstraction(
+#                         name,
+#                         encoding.squeeze().tolist(),
+#                         model,
+#                         children=child_nodes
+#                     )
+
+#     # ------------------------------------------------------------------
+#     # NO ABSTRACTION
+#     # ------------------------------------------------------------------
+#     if detailed_debug:
+#         debug_info(f"{indent}[{depth}] No abstraction applied.")
+#     return current_node
