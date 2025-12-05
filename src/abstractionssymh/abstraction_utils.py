@@ -306,6 +306,141 @@ class PCAModel(nn.Module):
         decoded = self.decoder(latent)
         return latent, decoded
 
+# class VariationalAutoencoder(nn.Module):
+#     """
+#     Variational Autoencoder (VAE) for probabilistic compression.
+    
+#     Instead of mapping to a single point, it maps to a probability distribution 
+#     (mean and variance) in the latent space.
+#     """
+#     def __init__(self, input_dim, hidden_dim):
+#         super().__init__()
+#         self.input_dim = input_dim
+#         self.hidden_dim = hidden_dim
+
+#         # Shared encoder parts
+#         self.encoder_shared = nn.Sequential(
+#             nn.Linear(input_dim, AUTOENCODER_LAYER_1_SIZE),
+#             nn.ReLU(),
+#             nn.Linear(AUTOENCODER_LAYER_1_SIZE, AUTOENCODER_LAYER_2_SIZE),
+#             nn.ReLU()
+#         )
+        
+#         # Split into two heads: Mean (mu) and Log-Variance (logvar)
+#         self.fc_mu = nn.Linear(AUTOENCODER_LAYER_2_SIZE, hidden_dim)
+#         self.fc_logvar = nn.Linear(AUTOENCODER_LAYER_2_SIZE, hidden_dim)
+
+#         # Decoder (Standard)
+#         self.decoder_net = nn.Sequential(
+#             nn.Linear(hidden_dim, AUTOENCODER_LAYER_2_SIZE),
+#             nn.ReLU(),
+#             nn.Linear(AUTOENCODER_LAYER_2_SIZE, AUTOENCODER_LAYER_1_SIZE),
+#             nn.ReLU(),
+#             nn.Linear(AUTOENCODER_LAYER_1_SIZE, input_dim),
+#         )
+
+#         # Placeholders for normalization stats (same as AE)
+#         self.data_mean_ = None
+#         self.data_std_ = None
+
+#     def reparameterize(self, mu, logvar):
+#         """
+#         The 'Reparameterization Trick':
+#         Sample z = mu + std * epsilon
+#         """
+#         if self.training:
+#             std = torch.exp(0.5 * logvar)
+#             eps = torch.randn_like(std)
+#             return mu + eps * std
+#         else:
+#             # During inference (integration), just return the mean
+#             return mu
+
+#     def encoder(self, x):
+#         """Returns the mean (mu) latent vector. Used for deterministic compression."""
+#         shared = self.encoder_shared(x)
+#         return self.fc_mu(shared)
+
+#     def decoder(self, z):
+#         """Standard decoding from latent space."""
+#         return self.decoder_net(z)
+
+#     def forward(self, x):
+#         """
+#         Returns:
+#             recon_x: Reconstructed input
+#             mu: Mean of latent distribution
+#             logvar: Log variance of latent distribution
+#         """
+#         shared = self.encoder_shared(x)
+#         mu = self.fc_mu(shared)
+#         logvar = self.fc_logvar(shared)
+        
+#         z = self.reparameterize(mu, logvar)
+#         recon_x = self.decoder_net(z)
+        
+#         return recon_x, mu, logvar
+
+import torch
+import torch.nn as nn
+from torch.nn.utils import spectral_norm
+
+class VariationalAutoencoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, latent_dim=2):
+        super(VariationalAutoencoder, self).__init__()
+        
+        # --- FIX: Store input_dim so helper functions can check it ---
+        self.input_dim = input_dim 
+        # -------------------------------------------------------------
+
+        self.register_buffer('data_mean_', torch.zeros(input_dim))
+        self.register_buffer('data_std_', torch.ones(input_dim))
+
+        # --- ENCODER (Lipschitz/Spectral Norm) ---
+        self.encoder_shared = nn.Sequential(
+            spectral_norm(nn.Linear(input_dim, hidden_dim)),
+            nn.LeakyReLU(0.2),
+            spectral_norm(nn.Linear(hidden_dim, hidden_dim)),
+            nn.LeakyReLU(0.2)
+        )
+        
+        self.fc_mu = spectral_norm(nn.Linear(hidden_dim, latent_dim))
+        self.fc_logvar = spectral_norm(nn.Linear(hidden_dim, latent_dim))
+
+        # --- DECODER ---
+        self.decoder = nn.Sequential(
+            spectral_norm(nn.Linear(latent_dim, hidden_dim)),
+            nn.LeakyReLU(0.2),
+            spectral_norm(nn.Linear(hidden_dim, hidden_dim)),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, input_dim) 
+        )
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        # 1. Encode
+        h = self.encoder_shared(x)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        
+        # 2. Sample or Inference
+        if self.training:
+            z = self.reparameterize(mu, logvar)
+            recon_x = self.decoder(z)
+            return recon_x, mu, logvar
+        else:
+            # Inference: return just reconstruction and latent mean
+            recon_x = self.decoder(mu)
+            return recon_x, mu
+    
+def vae_loss_fn(recon_x, x, mu, logvar, kl_weight=0.001):
+    mse_loss = nn.functional.mse_loss(recon_x, x, reduction='sum')
+    kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return mse_loss + (kl_weight * kld_loss)
 
 def instantiate_pattern(pattern_name, params, children):
     """Rebuild a concrete DSL node (or subtree) from its components.
@@ -824,108 +959,30 @@ def expand_l1_to_l0(l1_dsl_node, singleton_models_L1, pair_models_L1):
     return result
 
 class Abstraction:
-    """Represents a compressed DSL pattern using an autoencoder or PCA.
-
-    This node acts as a "subroutine" in the DSL tree. It stores the
-    name of a common pattern (e.g., "Translate(Rotate)"), a
-    low-dimensional `compressed_params` vector, and the `model`
-    required to decompress those parameters back into their full,
-    concrete form.
-
-    Attributes
-    ----------
-    pattern_name : str
-        Name of the abstracted pattern (e.g., "Scale", "Translate(Rotate)").
-    compressed_params : list
-        The compressed latent representation (a low-dimensional vector).
-    model : Autoencoder or PCAModel
-        The trained model (with attached `data_mean_` and `data_std_`)
-        used for reconstruction.
-    children : list
-        A list of child nodes. For a singleton abstraction like `Abs(Scale)`,
-        the child is the node that `Scale` would have wrapped. For a pair
-        abstraction like `Abs(Translate(Rotate))`, the children are the
-        children of the `Rotate` node.
-    """
-
     def __init__(self, pattern_name, compressed_params, model, children=None):
-        """Initialize an abstraction node.
-
-        Parameters
-        ----------
-        pattern_name : str
-            Name of the pattern.
-        compressed_params : list
-            Compressed latent representation.
-        model : Autoencoder or PCAModel
-            Trained model for reconstruction.
-        children : list, optional
-            Child nodes. Defaults to an empty list.
-        """
         self.pattern_name = pattern_name
         self.compressed_params = compressed_params
         self.model = model
         self.children = children if children is not None else []
 
     def __str__(self):
-        """Return a string representation of the abstraction."""
         header = f"Abs({self.pattern_name}, dim={len(self.compressed_params)})"
-        param_str = f"compressed_params={self.compressed_params}"
-        
-        if not self.children:
-            return f"{header}, {param_str}"
-        else:
-            child_strs = [textwrap.indent(str(c), "    ") for c in self.children]
-            return f"{header}, {param_str}(\n" + ",\n".join(child_strs) + "\n)"
+        return f"{header}"
 
     __repr__ = __str__
 
     def expand(self):
-        """Reconstruct the full DSL node and call its `expand()` method.
-
-        This is the core "decompression" step. It uses the stored `model`
-        to decode the `compressed_params`, un-normalizes them, and then
-        uses `instantiate_pattern` to build the concrete DSL subtree.
-        Finally, it calls the `.expand()` method of that new subtree
-        to get the final box geometries.
-
-        Returns
-        -------
-        list[dict]
-            A list of box geometry dictionaries, just like any other
-            DSL node's `expand()` method. Returns a single "error" box
-            if expansion fails.
-        """
-        debug_info(f"Expanding abstraction: {self}")
-        if not self.compressed_params:
-            debug_error("No compressed params found. Returning Box(-1).")
-            return Box(-1).expand()  # Return expanded box
-
+        if not self.compressed_params: return Box(-1).expand()
         self.model.eval()
         with torch.no_grad():
-            params_tensor = t(
-                torch.tensor(self.compressed_params, dtype=torch.float32)
-            ).unsqueeze(0)
+            params_tensor = t(torch.tensor(self.compressed_params, dtype=torch.float32)).unsqueeze(0)
+            output = self.model.decoder(params_tensor)
+            # FIX: VAE might return tuple? Safely check
+            normalized_reconstruction = output[0] if isinstance(output, tuple) else output
             
-            # 1. Decoder outputs *normalized* parameters
-            normalized_reconstruction = self.model.decoder(params_tensor)
-            
-            # 2. Un-normalize the parameters
-            reconstructed_params_tensor = (
-                (normalized_reconstruction * self.model.data_std_) + 
-                self.model.data_mean_
-            )
-            
+            reconstructed_params_tensor = ((normalized_reconstruction * self.model.data_std_) + self.model.data_mean_)
             reconstructed_params = reconstructed_params_tensor.squeeze().tolist()
-            debug_success(
-                f"Reconstructed (un-normalized) params: {reconstructed_params}"
-            )
-
-        rebuilt_node = instantiate_pattern(
-            self.pattern_name, reconstructed_params, self.children
-        )
-        debug_success(f"Successfully rebuilt node: {rebuilt_node}")
-        return rebuilt_node.expand()
+        return instantiate_pattern(self.pattern_name, reconstructed_params, self.children).expand()
 
 
 def prepare_autoencoder_train_data(
@@ -978,44 +1035,24 @@ def prepare_autoencoder_train_data(
     return dataloader
 
 
-def is_well_explained(
-    model,
-    parameters_tensor,
-    error_threshold=ERROR_THRESHOLD
-):
-    """Check which parameter sets are well reconstructed by a model.
-
-    This function normalizes the input data using the model's stored
-    `data_mean_` and `data_std_`, then computes the reconstruction error
-    in the *normalized* space.
-
-    Parameters
-    ----------
-    model : Autoencoder or PCAModel
-        The trained model, which must have `data_mean_` and `data_std_`
-        attributes.
-    parameters_tensor : torch.Tensor
-        The *un-normalized* input parameter vectors to check.
-    error_threshold : float, optional
-        The maximum allowed reconstruction error in the normalized space.
-
-    Returns
-    -------
-    torch.BoolTensor
-        A boolean mask where `True` indicates the parameter set was
-        "well-explained" (i.e., had an error below the threshold).
-    """
+def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD):
     model.eval()
     with torch.no_grad():
-        # Normalize the input data using the model's stored stats
         normalized_input = (parameters_tensor - model.data_mean_) / model.data_std_
+        output = model(normalized_input)
         
-        # Model takes normalized input and produces normalized output
-        _, reconstructions = model(normalized_input)
-        
-        # Compare normalized reconstruction to normalized input
+        # --- FIX: Handle VAE tuple output ---
+        if isinstance(output, tuple):
+            if len(output) == 3: # Training mode signature (recon, mu, logvar)
+                 reconstructions = output[0]
+            else: # Inference mode signature (recon, mu)
+                 reconstructions = output[0]
+        else:
+            # AE/PCA case: output is (latent, reconstructions) or just reconstructions
+            reconstructions = output[1]
+
         error, _ = torch.max(torch.abs(reconstructions - normalized_input), dim=-1)
-        
+    
     well_explained = error < error_threshold
     return well_explained, error
 
@@ -1145,6 +1182,69 @@ def train_autoencoder(
 
     return model
 
+def train_vae(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE, save_dir=None):
+    """
+    Train a Variational Autoencoder with tqdm progress tracking.
+    """
+    optimizer = AdamW(model.parameters(), lr=lr)
+    epoch_losses = []
+
+    model.train() 
+
+    total_batches = epochs * len(dataloader)
+    
+    with tqdm(total=total_batches, desc=f"Training VAE {model_name}", unit="batch") as pbar:
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            num_samples = 0
+            
+            for batch in dataloader:
+                x = batch[0].to(DEVICE)
+                optimizer.zero_grad()
+                
+                # Forward pass returns 3 values
+                recon_x, mu, logvar = model(x)
+                
+                loss = vae_loss_fn(recon_x, x, mu, logvar, kl_weight=0.01)
+                
+                loss.backward()
+                optimizer.step()
+                
+                batch_loss = loss.item() * x.size(0)
+                epoch_loss += batch_loss
+                num_samples += x.size(0)
+
+                pbar.set_postfix({
+                    "epoch": f"{epoch+1}/{epochs}",
+                    "batch_loss": f"{loss.item():.6f}"
+                })
+                pbar.update(1)
+
+            avg_epoch_loss = epoch_loss / num_samples if num_samples > 0 else 0
+            epoch_losses.append(avg_epoch_loss)
+        
+    # Plot epoch losses
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
+    ax.plot(range(1, epochs + 1), epoch_losses, marker='o', linestyle='-', label='Training Loss')
+    ax.set_title(f"Training Loss for VAE Model: {model_name}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Average Loss (ELBO)")
+    ax.grid(True, linestyle='--', alpha=0.6)
+    
+    if save_dir:
+        try:
+            save_path = Path(save_dir)
+            save_path.mkdir(parents=True, exist_ok=True)
+            safe_filename = make_safe_filename(model_name, suffix="loss_chart") + ".png"
+            fig.savefig(save_path / safe_filename)
+        except Exception as e:
+            debug_error(f"Failed to save loss chart: {e}")
+
+    plt.show()
+    plt.close(fig)
+        
+    return model
+
 # ==============================================================================
 # --- NEW MERGED ABSTRACTION FINDER ---
 # ==============================================================================
@@ -1211,7 +1311,7 @@ def find_abstractions(
     debug_info("Structures sorted by sample count (descending).")
 
     method_name = method.lower()
-    if method_name not in ['ae', 'pca']:
+    if method_name not in ['ae', 'pca', 'vae']:
         debug_error(f"Unknown method '{method}'. Defaulting to 'ae'.")
         method_name = 'ae'
     else:
@@ -1315,6 +1415,20 @@ def find_abstractions(
                 debug_info(f"AE training complete for '{name}'.")
 
             # ------------------------------------------------------------------
+            # VARIATIONAL AUTOENCODER METHOD
+            # ------------------------------------------------------------------
+            elif method_name == 'vae':
+                # --- FIX: Define dataloader for VAE block correctly ---
+                dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
+                if len(dataloader.dataset) == 0: break
+                
+                model = VariationalAutoencoder(num_params, hidden_dim).to(DEVICE)
+                model.data_mean_ = data_mean.to(DEVICE)
+                model.data_std_ = data_std.to(DEVICE)
+                model = train_vae(model, dataloader, model_name=name, epochs=epochs, lr=lr, save_dir=save_dir)
+
+
+            # ------------------------------------------------------------------
             # RE-EVALUATE MASK (OUTLIER FILTERING)
             # ------------------------------------------------------------------
             debug_info(f"Recomputing mask for '{name}' using error threshold {error_threshold}...")
@@ -1410,156 +1524,67 @@ def debug_abstraction(msg):
     debug_success(f"[ABSTRACT] {msg}")
 
 
+# ==============================================================================
+# --- INTEGRATION FUNCTION ---
+# ==============================================================================
+
+def debug_abstraction(msg):
+    debug_success(f"[ABSTRACT] {msg}")
+
 def integrate_abstractions(
     node,
     singleton_models,
     pair_models,
     error_threshold=ERROR_THRESHOLD,
-    geometric_threshold=0.05,  # <--- NEW: Geometric threshold (default 5cm if units=m)
-    points_per_check=50,       # <--- NEW: Low point count for speed
+    geometric_threshold=0.05,
+    points_per_check=50,
     depth=0,
     detailed_debug=False
 ):
-    """Recursively abstract a DSL tree using both Parameter and Geometric metrics.
-
-    1. Checks Parametric MSE (Fast).
-    2. If passed, checks Geometric Chamfer Distance (Slow but accurate).
-    """
-    # --- Local Imports to avoid circular dependencies ---
-    from abstractionssymh.abstraction_compare_utils import (
-        get_point_cloud_from_dsl, 
-        calculate_chamfer_distance
-    )
-    from abstractionssymh.abstraction_utils import Abstraction, t, debug_abstraction
-
+    from abstractionssymh.abstraction_compare_utils import get_point_cloud_from_dsl, calculate_chamfer_distance
+    
     indent = "  " * depth
-    node_name = f"Abs({node.pattern_name})" if isinstance(node, Abstraction) else type(node).__name__
-
-    if detailed_debug:
-        debug_info(f"{indent}[{depth}] Processing: {node_name}")
-
-    # ------------------------------------------------------------------
-    # ALREADY ABSTRACTED
-    # ------------------------------------------------------------------
+    
+    # [Recursion and serialization logic remains identical to original]
     if isinstance(node, Abstraction):
-        if detailed_debug:
-            debug_info(f"{indent}[{depth}] Already abstracted; recursing into children.")
-        node.children = [
-            integrate_abstractions(c, singleton_models, pair_models,
-                                   error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug)
-            for c in node.children
-        ]
+        node.children = [integrate_abstractions(c, singleton_models, pair_models, error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug) for c in node.children]
         return node
+    if not hasattr(node, "serialize"): return node
 
-    # ------------------------------------------------------------------
-    # NODE WITHOUT serialize()
-    # ------------------------------------------------------------------
-    if not hasattr(node, "serialize"):
-        if detailed_debug:
-            debug_error(f"{indent}[{depth}] Node {type(node).__name__} lacks serialize().")
-        return node
-
-    # ------------------------------------------------------------------
-    # RECURSE (Bottom-Up)
-    # ------------------------------------------------------------------
-    try:
-        _, (_, children) = node.serialize()
-    except Exception as e:
-        if detailed_debug:
-            debug_error(f"{indent}[{depth}] Failed to serialize {node_name}: {e}")
-        return node
-
-    valid_children = [
-        c for c in children if hasattr(c, "serialize") or isinstance(c, Abstraction)
-    ]
-    if detailed_debug:
-        debug_info(f"{indent}[{depth}] Recursing into {len(valid_children)} children.")
+    try: _, (_, children) = node.serialize()
+    except Exception: return node
 
     rebuilt_children = []
     for c in children:
         if hasattr(c, "serialize") or isinstance(c, Abstraction):
-            rebuilt_children.append(
-                integrate_abstractions(c, singleton_models, pair_models,
-                                       error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug)
-            )
-        else:
-            rebuilt_children.append(c)
+            rebuilt_children.append(integrate_abstractions(c, singleton_models, pair_models, error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug))
+        else: rebuilt_children.append(c)
 
-    if detailed_debug:
-        debug_info(f"{indent}[{depth}] Finished children for {node_name}")
-
-    # ------------------------------------------------------------------
-    # REBUILD ORIGINAL NODE
-    # ------------------------------------------------------------------
+    # Rebuild Node logic [Same as original]
     try:
-        if isinstance(node, Union):
-            current_node = Union(rebuilt_children[0], rebuilt_children[1])
-        elif isinstance(node, SymRef):
-            current_node = SymRef(
-                rebuilt_children[0],
-                plane_normal=node.plane,
-                point_on_plane=node.point_on_plane
-            )
-        elif isinstance(node, SymRot):
-            current_node = SymRot(
-                rebuilt_children[0],
-                axis=node.axis,
-                center=node.center,
-                n_fold=node.n
-            )
-        elif isinstance(node, SymTrans):
-            current_node = SymTrans(
-                rebuilt_children[0], end_point=node.end_point, n_fold=node.n
-            )
+        if isinstance(node, Union): current_node = Union(rebuilt_children[0], rebuilt_children[1])
+        elif isinstance(node, SymRef): current_node = SymRef(rebuilt_children[0], plane_normal=node.plane, point_on_plane=node.point_on_plane)
+        elif isinstance(node, SymRot): current_node = SymRot(rebuilt_children[0], axis=node.axis, center=node.center, n_fold=node.n)
+        elif isinstance(node, SymTrans): current_node = SymTrans(rebuilt_children[0], end_point=node.end_point, n_fold=node.n)
         elif hasattr(node, "child"):
             kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
             current_node = type(node)(rebuilt_children[0], **kwargs)
-        else:
-            current_node = type(node)(*rebuilt_children)
+        else: current_node = type(node)(*rebuilt_children)
+    except Exception: return node
 
-        if detailed_debug:
-            debug_info(f"{indent}[{depth}] Rebuilt node {type(current_node).__name__}")
-    except Exception as e:
-        if detailed_debug:
-            debug_error(f"{indent}[{depth}] Failed rebuild: {e}")
-        return node
-
-    # --- HELPER: Geometric Verification ---
     def check_geometric_fidelity(original_node, candidate_abstraction):
-        """Returns True if the abstraction geometrically resembles the original."""
         try:
-            # Generate Local Point Clouds (relative to this node's frame)
             pc_orig = get_point_cloud_from_dsl(original_node, points_per_box=points_per_check)
             pc_cand = get_point_cloud_from_dsl(candidate_abstraction, points_per_box=points_per_check)
-            
-            # If either is empty, fail safely (unless both are empty, which implies match)
-            if len(pc_orig) == 0 and len(pc_cand) == 0: return True
             if len(pc_orig) == 0 or len(pc_cand) == 0: return False
-
-            # Calculate Chamfer
             dist = calculate_chamfer_distance(pc_orig, pc_cand)
-            
-            if detailed_debug:
-                if dist > geometric_threshold:
-                    debug_info(f"{indent}[GEO REJECT] Chamfer {dist:.4f} > {geometric_threshold}")
-                else:
-                    debug_info(f"{indent}[GEO PASS] Chamfer {dist:.4f} <= {geometric_threshold}")
-            
             return dist <= geometric_threshold
-        except Exception as e:
-            if detailed_debug: debug_error(f"Geometry check failed: {e}")
-            return False
+        except Exception: return False
 
-    # ------------------------------------------------------------------
-    # PAIR ABSTRACTION ATTEMPT
-    # ------------------------------------------------------------------
-    child_nodes = [
-        c for c in rebuilt_children if hasattr(c, "serialize") or isinstance(c, Abstraction)
-    ]
-
+    # --- PAIR ABSTRACTION ---
+    child_nodes = [c for c in rebuilt_children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
     if len(child_nodes) == 1:
         child = child_nodes[0]
-
         if isinstance(child, Abstraction):
             child_name = f"Abs({child.pattern_name})"
             child_params = child.compressed_params
@@ -1567,94 +1592,315 @@ def integrate_abstractions(
         else:
             child_name = type(child).__name__
             child_params, gc_raw = child.serialize()[1]
-            grandchildren = [
-                gc for gc in gc_raw if hasattr(gc, "serialize") or isinstance(gc, Abstraction)
-            ]
+            grandchildren = [gc for gc in gc_raw if hasattr(gc, "serialize") or isinstance(gc, Abstraction)]
 
         pair_sig = f"{type(current_node).__name__}({child_name})"
 
         if pair_sig in pair_models:
-            if detailed_debug:
-                debug_info(f"{indent}[{depth}] Checking PAIR: {pair_sig}")
-
             model = pair_models[pair_sig]
             p_params, _ = current_node.serialize()[1]
-
-            combined = t(torch.tensor(
-                list(p_params or []) + list(child_params or []),
-                dtype=torch.float32
-            )).unsqueeze(0)
-
-            if combined.shape[1] == model.input_dim:
+            
+            combined = t(torch.tensor(list(p_params or []) + list(child_params or []), dtype=torch.float32)).unsqueeze(0)
+            
+            # --- FIX: Explicit dimension check to prevent runtime errors ---
+            if hasattr(model, 'input_dim') and combined.shape[1] == model.input_dim:
                 normalized = (combined - model.data_mean_) / model.data_std_
-                _, recon = model(normalized)
+                
+                # --- FIX: Handle VAE tuple output safely ---
+                output = model(normalized)
+                if isinstance(output, tuple):
+                     # VAE Inference returns (recon, mu)
+                    recon = output[0]
+                    encoding = output[1]
+                else:
+                    # AE returns (latent, recon)
+                    encoding = output[0]
+                    recon = output[1]
+
                 param_error = torch.max(torch.abs(recon - normalized)).item()
 
-                if detailed_debug:
-                    debug_info(f"{indent}[{depth}] Pair error {param_error:.4f}")
-
-                # 1. FAST CHECK: Parameter Error
                 if param_error < error_threshold:
-                    encoding, _ = model(normalized)
-                    
-                    # Create Candidate
-                    candidate = Abstraction(
-                        pair_sig,
-                        encoding.squeeze().tolist(),
-                        model,
-                        children=grandchildren
-                    )
-                    
-                    # 2. SLOW CHECK: Geometric Fidelity
+                    candidate = Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
                     if check_geometric_fidelity(current_node, candidate):
                         if detailed_debug: debug_abstraction(f"Applied PAIR: {pair_sig}")
                         return candidate
 
-    # ------------------------------------------------------------------
-    # SINGLETON ABSTRACTION ATTEMPT
-    # ------------------------------------------------------------------
+    # --- SINGLETON ABSTRACTION ---
     name = type(current_node).__name__
     if name in singleton_models:
-        if detailed_debug:
-            debug_info(f"{indent}[{depth}] Checking SINGLETON: {name}")
-
         model = singleton_models[name]
         params, _ = current_node.serialize()[1]
-
         if params:
             params_tensor = t(torch.tensor(params, dtype=torch.float32)).unsqueeze(0)
-
-            if params_tensor.shape[1] == model.input_dim:
+            
+            # --- FIX: Explicit dimension check ---
+            if hasattr(model, 'input_dim') and params_tensor.shape[1] == model.input_dim:
                 normalized = (params_tensor - model.data_mean_) / model.data_std_
-                _, recon = model(normalized)
+                
+                # --- FIX: Handle VAE tuple output safely ---
+                output = model(normalized)
+                if isinstance(output, tuple):
+                    recon = output[0]
+                    encoding = output[1]
+                else:
+                    encoding = output[0]
+                    recon = output[1]
+
                 param_error = torch.max(torch.abs(recon - normalized)).item()
 
-                if detailed_debug:
-                    debug_info(f"{indent}[{depth}] Singleton error {param_error:.4f}")
-
-                # 1. FAST CHECK
                 if param_error < error_threshold:
-                    encoding, _ = model(normalized)
-                    
-                    # Create Candidate
-                    candidate = Abstraction(
-                        name,
-                        encoding.squeeze().tolist(),
-                        model,
-                        children=child_nodes
-                    )
-                    
-                    # 2. SLOW CHECK
+                    candidate = Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
                     if check_geometric_fidelity(current_node, candidate):
                         if detailed_debug: debug_abstraction(f"Applied SINGLETON: {name}")
                         return candidate
 
-    # ------------------------------------------------------------------
-    # NO ABSTRACTION
-    # ------------------------------------------------------------------
-    if detailed_debug:
-        debug_info(f"{indent}[{depth}] No abstraction applied.")
     return current_node
+
+# def integrate_abstractions(
+#     node,
+#     singleton_models,
+#     pair_models,
+#     error_threshold=ERROR_THRESHOLD,
+#     geometric_threshold=0.05,  # <--- NEW: Geometric threshold (default 5cm if units=m)
+#     points_per_check=50,       # <--- NEW: Low point count for speed
+#     depth=0,
+#     detailed_debug=False
+# ):
+#     """Recursively abstract a DSL tree using both Parameter and Geometric metrics.
+
+#     1. Checks Parametric MSE (Fast).
+#     2. If passed, checks Geometric Chamfer Distance (Slow but accurate).
+#     """
+#     # --- Local Imports to avoid circular dependencies ---
+#     from abstractionssymh.abstraction_compare_utils import (
+#         get_point_cloud_from_dsl, 
+#         calculate_chamfer_distance
+#     )
+#     from abstractionssymh.abstraction_utils import Abstraction, t, debug_abstraction
+
+#     indent = "  " * depth
+#     node_name = f"Abs({node.pattern_name})" if isinstance(node, Abstraction) else type(node).__name__
+
+#     if detailed_debug:
+#         debug_info(f"{indent}[{depth}] Processing: {node_name}")
+
+#     # ------------------------------------------------------------------
+#     # ALREADY ABSTRACTED
+#     # ------------------------------------------------------------------
+#     if isinstance(node, Abstraction):
+#         if detailed_debug:
+#             debug_info(f"{indent}[{depth}] Already abstracted; recursing into children.")
+#         node.children = [
+#             integrate_abstractions(c, singleton_models, pair_models,
+#                                    error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug)
+#             for c in node.children
+#         ]
+#         return node
+
+#     # ------------------------------------------------------------------
+#     # NODE WITHOUT serialize()
+#     # ------------------------------------------------------------------
+#     if not hasattr(node, "serialize"):
+#         if detailed_debug:
+#             debug_error(f"{indent}[{depth}] Node {type(node).__name__} lacks serialize().")
+#         return node
+
+#     # ------------------------------------------------------------------
+#     # RECURSE (Bottom-Up)
+#     # ------------------------------------------------------------------
+#     try:
+#         _, (_, children) = node.serialize()
+#     except Exception as e:
+#         if detailed_debug:
+#             debug_error(f"{indent}[{depth}] Failed to serialize {node_name}: {e}")
+#         return node
+
+#     valid_children = [
+#         c for c in children if hasattr(c, "serialize") or isinstance(c, Abstraction)
+#     ]
+#     if detailed_debug:
+#         debug_info(f"{indent}[{depth}] Recursing into {len(valid_children)} children.")
+
+#     rebuilt_children = []
+#     for c in children:
+#         if hasattr(c, "serialize") or isinstance(c, Abstraction):
+#             rebuilt_children.append(
+#                 integrate_abstractions(c, singleton_models, pair_models,
+#                                        error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug)
+#             )
+#         else:
+#             rebuilt_children.append(c)
+
+#     if detailed_debug:
+#         debug_info(f"{indent}[{depth}] Finished children for {node_name}")
+
+#     # ------------------------------------------------------------------
+#     # REBUILD ORIGINAL NODE
+#     # ------------------------------------------------------------------
+#     try:
+#         if isinstance(node, Union):
+#             current_node = Union(rebuilt_children[0], rebuilt_children[1])
+#         elif isinstance(node, SymRef):
+#             current_node = SymRef(
+#                 rebuilt_children[0],
+#                 plane_normal=node.plane,
+#                 point_on_plane=node.point_on_plane
+#             )
+#         elif isinstance(node, SymRot):
+#             current_node = SymRot(
+#                 rebuilt_children[0],
+#                 axis=node.axis,
+#                 center=node.center,
+#                 n_fold=node.n
+#             )
+#         elif isinstance(node, SymTrans):
+#             current_node = SymTrans(
+#                 rebuilt_children[0], end_point=node.end_point, n_fold=node.n
+#             )
+#         elif hasattr(node, "child"):
+#             kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
+#             current_node = type(node)(rebuilt_children[0], **kwargs)
+#         else:
+#             current_node = type(node)(*rebuilt_children)
+
+#         if detailed_debug:
+#             debug_info(f"{indent}[{depth}] Rebuilt node {type(current_node).__name__}")
+#     except Exception as e:
+#         if detailed_debug:
+#             debug_error(f"{indent}[{depth}] Failed rebuild: {e}")
+#         return node
+
+#     # --- HELPER: Geometric Verification ---
+#     def check_geometric_fidelity(original_node, candidate_abstraction):
+#         """Returns True if the abstraction geometrically resembles the original."""
+#         try:
+#             # Generate Local Point Clouds (relative to this node's frame)
+#             pc_orig = get_point_cloud_from_dsl(original_node, points_per_box=points_per_check)
+#             pc_cand = get_point_cloud_from_dsl(candidate_abstraction, points_per_box=points_per_check)
+            
+#             # If either is empty, fail safely (unless both are empty, which implies match)
+#             if len(pc_orig) == 0 and len(pc_cand) == 0: return True
+#             if len(pc_orig) == 0 or len(pc_cand) == 0: return False
+
+#             # Calculate Chamfer
+#             dist = calculate_chamfer_distance(pc_orig, pc_cand)
+            
+#             if detailed_debug:
+#                 if dist > geometric_threshold:
+#                     debug_info(f"{indent}[GEO REJECT] Chamfer {dist:.4f} > {geometric_threshold}")
+#                 else:
+#                     debug_info(f"{indent}[GEO PASS] Chamfer {dist:.4f} <= {geometric_threshold}")
+            
+#             return dist <= geometric_threshold
+#         except Exception as e:
+#             if detailed_debug: debug_error(f"Geometry check failed: {e}")
+#             return False
+
+#     # ------------------------------------------------------------------
+#     # PAIR ABSTRACTION ATTEMPT
+#     # ------------------------------------------------------------------
+#     child_nodes = [
+#         c for c in rebuilt_children if hasattr(c, "serialize") or isinstance(c, Abstraction)
+#     ]
+
+#     if len(child_nodes) == 1:
+#         child = child_nodes[0]
+
+#         if isinstance(child, Abstraction):
+#             child_name = f"Abs({child.pattern_name})"
+#             child_params = child.compressed_params
+#             grandchildren = child.children
+#         else:
+#             child_name = type(child).__name__
+#             child_params, gc_raw = child.serialize()[1]
+#             grandchildren = [
+#                 gc for gc in gc_raw if hasattr(gc, "serialize") or isinstance(gc, Abstraction)
+#             ]
+
+#         pair_sig = f"{type(current_node).__name__}({child_name})"
+
+#         if pair_sig in pair_models:
+#             if detailed_debug:
+#                 debug_info(f"{indent}[{depth}] Checking PAIR: {pair_sig}")
+
+#             model = pair_models[pair_sig]
+#             p_params, _ = current_node.serialize()[1]
+
+#             combined = t(torch.tensor(
+#                 list(p_params or []) + list(child_params or []),
+#                 dtype=torch.float32
+#             )).unsqueeze(0)
+
+#             if combined.shape[1] == model.input_dim:
+#                 normalized = (combined - model.data_mean_) / model.data_std_
+#                 _, recon = model(normalized)
+#                 param_error = torch.max(torch.abs(recon - normalized)).item()
+
+#                 if detailed_debug:
+#                     debug_info(f"{indent}[{depth}] Pair error {param_error:.4f}")
+
+#                 # 1. FAST CHECK: Parameter Error
+#                 if param_error < error_threshold:
+#                     encoding, _ = model(normalized)
+                    
+#                     # Create Candidate
+#                     candidate = Abstraction(
+#                         pair_sig,
+#                         encoding.squeeze().tolist(),
+#                         model,
+#                         children=grandchildren
+#                     )
+                    
+#                     # 2. SLOW CHECK: Geometric Fidelity
+#                     if check_geometric_fidelity(current_node, candidate):
+#                         if detailed_debug: debug_abstraction(f"Applied PAIR: {pair_sig}")
+#                         return candidate
+
+#     # ------------------------------------------------------------------
+#     # SINGLETON ABSTRACTION ATTEMPT
+#     # ------------------------------------------------------------------
+#     name = type(current_node).__name__
+#     if name in singleton_models:
+#         if detailed_debug:
+#             debug_info(f"{indent}[{depth}] Checking SINGLETON: {name}")
+
+#         model = singleton_models[name]
+#         params, _ = current_node.serialize()[1]
+
+#         if params:
+#             params_tensor = t(torch.tensor(params, dtype=torch.float32)).unsqueeze(0)
+
+#             if params_tensor.shape[1] == model.input_dim:
+#                 normalized = (params_tensor - model.data_mean_) / model.data_std_
+#                 _, recon = model(normalized)
+#                 param_error = torch.max(torch.abs(recon - normalized)).item()
+
+#                 if detailed_debug:
+#                     debug_info(f"{indent}[{depth}] Singleton error {param_error:.4f}")
+
+#                 # 1. FAST CHECK
+#                 if param_error < error_threshold:
+#                     encoding, _ = model(normalized)
+                    
+#                     # Create Candidate
+#                     candidate = Abstraction(
+#                         name,
+#                         encoding.squeeze().tolist(),
+#                         model,
+#                         children=child_nodes
+#                     )
+                    
+#                     # 2. SLOW CHECK
+#                     if check_geometric_fidelity(current_node, candidate):
+#                         if detailed_debug: debug_abstraction(f"Applied SINGLETON: {name}")
+#                         return candidate
+
+#     # ------------------------------------------------------------------
+#     # NO ABSTRACTION
+#     # ------------------------------------------------------------------
+#     if detailed_debug:
+#         debug_info(f"{indent}[{depth}] No abstraction applied.")
+#     return current_node
 
 # def integrate_abstractions(
 #     node,
