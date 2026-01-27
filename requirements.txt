@@ -10,3 +10,5 @@ scikit-learn
 seaborn
 scikit-dimension
 hdbscan
+egglog
+cloudpickle

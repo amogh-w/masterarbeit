@@ -389,13 +389,12 @@ class VariationalAutoencoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim=2):
         super(VariationalAutoencoder, self).__init__()
         
-        # --- FIX: Store input_dim so helper functions can check it ---
+        # Store input_dim so helper functions can check it
         self.input_dim = input_dim 
-        # -------------------------------------------------------------
-
+        
         self.register_buffer('data_mean_', torch.zeros(input_dim))
         self.register_buffer('data_std_', torch.ones(input_dim))
-
+        
         # --- ENCODER (Lipschitz/Spectral Norm) ---
         self.encoder_shared = nn.Sequential(
             spectral_norm(nn.Linear(input_dim, hidden_dim)),
@@ -406,7 +405,7 @@ class VariationalAutoencoder(nn.Module):
         
         self.fc_mu = spectral_norm(nn.Linear(hidden_dim, latent_dim))
         self.fc_logvar = spectral_norm(nn.Linear(hidden_dim, latent_dim))
-
+        
         # --- DECODER ---
         self.decoder = nn.Sequential(
             spectral_norm(nn.Linear(latent_dim, hidden_dim)),
@@ -415,12 +414,12 @@ class VariationalAutoencoder(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, input_dim) 
         )
-
+    
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-
+    
     def forward(self, x):
         # 1. Encode
         h = self.encoder_shared(x)
@@ -431,16 +430,34 @@ class VariationalAutoencoder(nn.Module):
         if self.training:
             z = self.reparameterize(mu, logvar)
             recon_x = self.decoder(z)
-            return recon_x, mu, logvar
+            return recon_x, mu, logvar, h  # Return encoder features for Lipschitz loss
         else:
             # Inference: return just reconstruction and latent mean
             recon_x = self.decoder(mu)
             return recon_x, mu
-    
-def vae_loss_fn(recon_x, x, mu, logvar, kl_weight=0.001):
+         
+def vae_loss_fn(recon_x, x, mu, logvar, h, h2=None, x2=None, kl_weight=0.001, lipschitz_weight=0.1):
+    # Standard VAE loss
     mse_loss = nn.functional.mse_loss(recon_x, x, reduction='sum')
     kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return mse_loss + (kl_weight * kld_loss)
+    
+    # Lipschitz regularization term
+    lipschitz_loss = torch.tensor(0.0, device=x.device)
+    if h2 is not None and x2 is not None:
+        # Calculate |f(x1) - f(x2)| / |x1 - x2|
+        h_diff = torch.norm(h - h2, dim=1)
+        x_diff = torch.norm(x - x2, dim=1)
+        
+        # Avoid division by zero
+        x_diff = torch.clamp(x_diff, min=1e-8)
+        
+        # Lipschitz ratio: h_diff / x_diff
+        lip_ratio = h_diff / x_diff
+        
+        # Your desired term: |1 - (|f(x1) - f(x2)|) / (|x1 - x2|)|
+        lipschitz_loss = torch.abs(1 - lip_ratio).sum()
+    
+    return mse_loss + (kl_weight * kld_loss) + (lipschitz_weight * lipschitz_loss)
 
 def instantiate_pattern(pattern_name, params, children):
     """Rebuild a concrete DSL node (or subtree) from its components.
@@ -1182,15 +1199,16 @@ def train_autoencoder(
 
     return model
 
-def train_vae(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE, save_dir=None):
+def train_vae(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE, save_dir=None, 
+              lipschitz_weight=0.1, gradient_penalty=False):
     """
-    Train a Variational Autoencoder with tqdm progress tracking.
+    Train a Variational Autoencoder with tqdm progress tracking and Lipschitz regularization.
     """
     optimizer = AdamW(model.parameters(), lr=lr)
     epoch_losses = []
-
-    model.train() 
-
+    
+    model.train()
+    
     total_batches = epochs * len(dataloader)
     
     with tqdm(total=total_batches, desc=f"Training VAE {model_name}", unit="batch") as pbar:
@@ -1198,37 +1216,72 @@ def train_vae(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE, sa
             epoch_loss = 0.0
             num_samples = 0
             
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
                 x = batch[0].to(DEVICE)
+                batch_size = x.size(0)
+                
                 optimizer.zero_grad()
                 
-                # Forward pass returns 3 values
-                recon_x, mu, logvar = model(x)
+                # Forward pass - returns 4 values now (recon_x, mu, logvar, h)
+                recon_x, mu, logvar, h = model(x)
                 
-                loss = vae_loss_fn(recon_x, x, mu, logvar, kl_weight=0.01)
+                # Compute standard VAE loss first
+                mse_loss = nn.functional.mse_loss(recon_x, x, reduction='sum')
+                kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                loss = mse_loss + (0.01 * kld_loss)
+                
+                # Add Lipschitz regularization if enabled and batch is large enough
+                if batch_size >= 2 and lipschitz_weight > 0:
+                    # Create pairs with SAME size for both groups
+                    pair_size = min(batch_size, 32)  # Use smaller size to ensure matching
+                    idx1 = torch.randperm(batch_size)[:pair_size]
+                    idx2 = torch.randperm(batch_size)[:pair_size]
+                    
+                    x1 = x[idx1]
+                    x2 = x[idx2]
+                    h1 = h[idx1]
+                    h2 = h[idx2]
+                    
+                    # Calculate Lipschitz loss
+                    h_diff = torch.norm(h1 - h2, dim=1)
+                    x_diff = torch.norm(x1 - x2, dim=1)
+                    
+                    # Avoid division by zero
+                    x_diff = torch.clamp(x_diff, min=1e-8)
+                    
+                    # Lipschitz ratio: h_diff / x_diff
+                    lip_ratio = h_diff / x_diff
+                    
+                    # Your desired term: |1 - (|f(x1) - f(x2)|) / (|x1 - x2|)|
+                    lipschitz_loss = torch.abs(1 - lip_ratio).sum()
+                    
+                    # Add to total loss
+                    loss = loss + (lipschitz_weight * lipschitz_loss)
                 
                 loss.backward()
                 optimizer.step()
                 
-                batch_loss = loss.item() * x.size(0)
+                # Track metrics
+                batch_loss = loss.item() * batch_size
                 epoch_loss += batch_loss
-                num_samples += x.size(0)
-
+                num_samples += batch_size
+                
                 pbar.set_postfix({
                     "epoch": f"{epoch+1}/{epochs}",
-                    "batch_loss": f"{loss.item():.6f}"
+                    "batch_loss": f"{loss.item()/batch_size:.6f}",
+                    "lip_weight": f"{lipschitz_weight:.4f}"
                 })
                 pbar.update(1)
-
+            
             avg_epoch_loss = epoch_loss / num_samples if num_samples > 0 else 0
             epoch_losses.append(avg_epoch_loss)
-        
+    
     # Plot epoch losses
     fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
     ax.plot(range(1, epochs + 1), epoch_losses, marker='o', linestyle='-', label='Training Loss')
     ax.set_title(f"Training Loss for VAE Model: {model_name}")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Average Loss (ELBO)")
+    ax.set_ylabel("Average Loss (ELBO + Lipschitz)")
     ax.grid(True, linestyle='--', alpha=0.6)
     
     if save_dir:
@@ -1239,11 +1292,37 @@ def train_vae(model, dataloader, model_name, epochs=EPOCHS, lr=LEARNING_RATE, sa
             fig.savefig(save_path / safe_filename)
         except Exception as e:
             debug_error(f"Failed to save loss chart: {e}")
-
+    
     plt.show()
     plt.close(fig)
-        
+    
     return model
+
+def compute_gradient_penalty(model, real_samples, fake_samples, device):
+    """Calculates the gradient penalty loss for WGAN-GP"""
+    # Random weight term for interpolation between real and fake samples
+    alpha = torch.rand((real_samples.size(0), 1), device=device)
+    
+    # Get random interpolation between real and fake samples
+    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+    
+    # Get encoder output for interpolates
+    h = model.encoder_shared(interpolates)
+    
+    # Calculate gradients of outputs with respect to inputs
+    gradients = torch.autograd.grad(
+        outputs=h,
+        inputs=interpolates,
+        grad_outputs=torch.ones_like(h),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    
+    return gradient_penalty
 
 # ==============================================================================
 # --- NEW MERGED ABSTRACTION FINDER ---
@@ -1417,15 +1496,26 @@ def find_abstractions(
             # ------------------------------------------------------------------
             # VARIATIONAL AUTOENCODER METHOD
             # ------------------------------------------------------------------
+            # elif method_name == 'vae':
+            #     # --- FIX: Define dataloader for VAE block correctly ---
+            #     dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
+            #     if len(dataloader.dataset) == 0: break
+                
+            #     model = VariationalAutoencoder(num_params, hidden_dim).to(DEVICE)
+            #     model.data_mean_ = data_mean.to(DEVICE)
+            #     model.data_std_ = data_std.to(DEVICE)
+            #     model = train_vae(model, dataloader, model_name=name, epochs=epochs, lr=lr, save_dir=save_dir)
             elif method_name == 'vae':
-                # --- FIX: Define dataloader for VAE block correctly ---
                 dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
                 if len(dataloader.dataset) == 0: break
                 
                 model = VariationalAutoencoder(num_params, hidden_dim).to(DEVICE)
                 model.data_mean_ = data_mean.to(DEVICE)
                 model.data_std_ = data_std.to(DEVICE)
-                model = train_vae(model, dataloader, model_name=name, epochs=epochs, lr=lr, save_dir=save_dir)
+                
+                # Add lipschitz_weight parameter
+                model = train_vae(model, dataloader, model_name=name, epochs=epochs, 
+                                lr=lr, save_dir=save_dir, lipschitz_weight=0.1)
 
 
             # ------------------------------------------------------------------
