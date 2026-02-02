@@ -1054,26 +1054,51 @@ def prepare_autoencoder_train_data(
 
 
 def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD):
+    """Checks if parameters are reconstructed accurately, with automatic dimension detection."""
     model.eval()
+    device = parameters_tensor.device
+    batch_size = parameters_tensor.shape[0]
+    
+    # --- ULTIMATE DIMENSION SHIELD ---
+    # Detect expected input dim from the model's first layer weights
+    expected_dim = None
+    try:
+        # Most of your models have an encoder.0 or fc1
+        for layer in model.modules():
+            if isinstance(layer, torch.nn.Linear):
+                expected_dim = layer.in_features
+                break
+    except:
+        pass
+
+    if expected_dim is not None and parameters_tensor.shape[1] != expected_dim:
+        # If dimensions don't match, return "Failure" mask immediately
+        return torch.zeros(batch_size, dtype=torch.bool, device=device), \
+               torch.ones(batch_size, device=device) * 1e6
+
     with torch.no_grad():
+        # Normalization
         normalized_input = (parameters_tensor - model.data_mean_) / model.data_std_
         output = model(normalized_input)
         
-        # --- FIX: Handle VAE tuple output ---
+        # Handle VAE vs AE output shapes
         if isinstance(output, tuple):
-            if len(output) == 3: # Training mode signature (recon, mu, logvar)
-                 reconstructions = output[0]
-            else: # Inference mode signature (recon, mu)
-                 reconstructions = output[0]
+            reconstructions = output[0] # (recon, mu, logvar)
         else:
-            # AE/PCA case: output is (latent, reconstructions) or just reconstructions
-            reconstructions = output[1]
+            reconstructions = output # Standard AE
+            # If AE returns (latent, recon) as a list
+            if hasattr(output, '__len__') and not isinstance(output, torch.Tensor) and len(output) > 1:
+                reconstructions = output[1]
+
+        # Final safety: if the math is about to happen on mismatched sizes, catch it
+        if reconstructions.shape != normalized_input.shape:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), \
+                   torch.ones(batch_size, device=device) * 1e6
 
         error, _ = torch.max(torch.abs(reconstructions - normalized_input), dim=-1)
     
     well_explained = error < error_threshold
     return well_explained, error
-
 
 def make_safe_filename(name: str, suffix: str = "") -> str:
     """Create a safe, sanitized filename from a string.
@@ -1338,53 +1363,17 @@ def find_abstractions(
     error_threshold=ERROR_THRESHOLD,
     epochs=EPOCHS,
     lr=LEARNING_RATE,
-    save_dir=None,  # <-- NEW PARAMETER
+    save_dir=None,
     plot_error_distribution=False
 ):
-    """Find abstractions for DSL patterns using either Autoencoder or PCA.
-
-    This is the main *training* function. It iterates through all
-    patterns ("structures") and trains a compression model (AE or PCA)
-    for each one that has enough examples.
-
-    It handles:
-    -   Calculating normalization stats (mean/std) for each pattern.
-    -   Iterative retraining to filter out outliers.
-    -   Attaching the `data_mean_` and `data_std_` to the final
-        trained model for later use in normalization/un-normalization.
-
-    Parameters
-    ----------
-    structures : dict
-        A dictionary mapping pattern names (str) to lists of
-        parameter vectors (list[list[float]]).
-    method : str, optional
-        The abstraction method: 'ae' (Autoencoder) or 'pca' (PCA).
-        Defaults to 'ae'.
-    structure_type : str, optional
-        A descriptive name for the type of structures being processed
-        (e.g., "L1 PATTERNS"), used for logging.
-    min_examples : int, optional
-        Minimum examples needed to train a model.
-    retrain_iterations : int, optional
-        Number of iterative retraining passes.
-    error_threshold : float, optional
-        Reconstruction error threshold for filtering outliers.
-    epochs : int, optional
-        Number of training epochs (used by 'ae' only).
-    lr : float, optional
-        Learning rate (used by 'ae' only).
-
-    Returns
-    -------
-    dict
-        A dictionary mapping pattern names (str) to their successfully
-        trained models (Autoencoder or PCAModel).
+    """
+    Find abstractions for DSL patterns using Autoencoder, VAE, or PCA.
+    Includes iterative retraining to filter outliers and dimension safety checks.
     """
     debug_info(f"Starting abstraction search for {len(structures)} {structure_type}...")
     trained_models = {}
 
-    # Sort by frequency
+    # Sort by frequency (most common patterns first)
     sorted_structures = sorted(
         structures.items(), key=lambda item: len(item[1]), reverse=True
     )
@@ -1408,7 +1397,18 @@ def find_abstractions(
             debug_info(f"Skipping '{name}': only {len(parameters)} examples (< {min_examples}).")
             continue
 
-        num_params = len(parameters[0])
+        # 1. PARAMETER CONSISTENCY CHECK
+        # Egglog refactoring can sometimes mix parameter lengths under one key. 
+        # We find the most common length and filter the rest.
+        from collections import Counter
+        lengths = [len(p) for p in parameters]
+        most_common_len, count = Counter(lengths).most_common(1)[0]
+        
+        if len(Counter(lengths)) > 1:
+            debug_info(f"Filtered inconsistent lengths for '{name}': keeping len={most_common_len} ({count} samples)")
+            parameters = [p for p in parameters if len(p) == most_common_len]
+        
+        num_params = most_common_len
         if num_params <= 1:
             debug_info(f"Skipping '{name}': only 1 parameter dimension.")
             continue
@@ -1416,9 +1416,7 @@ def find_abstractions(
         debug_info(f"Parameter dimension for '{name}': {num_params}")
 
         # Tensor preparation
-        params_tensor = t(torch.tensor(parameters, dtype=torch.float32))
-        debug_info(f"Loaded tensor for '{name}' with shape {params_tensor.shape}")
-
+        params_tensor = torch.tensor(parameters, dtype=torch.float32).to(DEVICE)
         mask = torch.ones(len(parameters), dtype=torch.bool, device=DEVICE)
         model = None
 
@@ -1426,13 +1424,10 @@ def find_abstractions(
         # ITERATIVE RE-TRAINING LOOP
         # ------------------------------------------------------------------
         for iteration in range(retrain_iterations):
-
             debug_info(f"-- Iteration {iteration+1} for '{name}' --")
-            debug_info(f"Current mask keeps {mask.sum().item()} / {len(mask)} samples.")
-
             current_params = params_tensor[mask]
 
-            if not current_params.any() or len(current_params) < 2:
+            if len(current_params) < 2:
                 debug_info(f"No more valid data for '{name}' in iteration {iteration+1}. Breaking.")
                 break
 
@@ -1441,49 +1436,25 @@ def find_abstractions(
             data_std = torch.std(current_params, dim=0)
             data_std[data_std == 0] = 1.0
 
-            debug_info(f"{name} Mean: {data_mean.tolist()}")
-            debug_info(f"{name} Std: {data_std.tolist()}")
-
             # ---- Hidden dimension decision ----
             hidden_dim = max(1, num_params - 1)
-            debug_info(f"Hidden dimension for '{name}': {hidden_dim}")
 
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             # PCA METHOD
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             if method_name == 'pca':
-                debug_info(f"Initializing PCA model for '{name}'...")
-
                 normalized_current_params = (current_params - data_mean) / data_std
-
                 model = PCAModel(num_params, hidden_dim).to(DEVICE)
                 model.data_mean_ = data_mean.to(DEVICE)
                 model.data_std_ = data_std.to(DEVICE)
-
-                debug_info(
-                    f"Fitting PCA for '{name}' (iteration {iteration+1}) "
-                    f"on {len(normalized_current_params)} normalized samples..."
-                )
-
                 model.fit(normalized_current_params)
 
-                debug_info(f"PCA training complete for '{name}'.")
-
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             # AUTOENCODER METHOD
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             elif method_name == 'ae':
-                debug_info(f"Preparing Autoencoder training data for '{name}'...")
-
-                dataloader = prepare_autoencoder_train_data(
-                    parameters, mask, data_mean, data_std
-                )
-                
-                if len(dataloader.dataset) == 0:
-                    debug_info(f"Dataloader empty for '{name}' in iteration {iteration+1}. Breaking.")
-                    break
-
-                debug_info(f"Training AE for '{name}' with {len(dataloader.dataset)} samples.")
+                dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
+                if len(dataloader.dataset) == 0: break
 
                 model = Autoencoder(num_params, hidden_dim).to(DEVICE)
                 model.data_mean_ = data_mean.to(DEVICE)
@@ -1492,120 +1463,68 @@ def find_abstractions(
                 model = train_autoencoder(
                     model, dataloader, model_name=name, epochs=epochs, lr=lr, save_dir=save_dir
                 )
-                debug_info(f"AE training complete for '{name}'.")
 
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             # VARIATIONAL AUTOENCODER METHOD
-            # ------------------------------------------------------------------
-            # elif method_name == 'vae':
-            #     # --- FIX: Define dataloader for VAE block correctly ---
-            #     dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
-            #     if len(dataloader.dataset) == 0: break
-                
-            #     model = VariationalAutoencoder(num_params, hidden_dim).to(DEVICE)
-            #     model.data_mean_ = data_mean.to(DEVICE)
-            #     model.data_std_ = data_std.to(DEVICE)
-            #     model = train_vae(model, dataloader, model_name=name, epochs=epochs, lr=lr, save_dir=save_dir)
+            # --------------------------------------------------------------
             elif method_name == 'vae':
                 dataloader = prepare_autoencoder_train_data(parameters, mask, data_mean, data_std)
                 if len(dataloader.dataset) == 0: break
-                
+
                 model = VariationalAutoencoder(num_params, hidden_dim).to(DEVICE)
                 model.data_mean_ = data_mean.to(DEVICE)
                 model.data_std_ = data_std.to(DEVICE)
-                
-                # Add lipschitz_weight parameter
-                model = train_vae(model, dataloader, model_name=name, epochs=epochs, 
-                                lr=lr, save_dir=save_dir, lipschitz_weight=0.1)
 
+                model = train_vae(
+                    model, dataloader, model_name=name, epochs=epochs, 
+                    lr=lr, save_dir=save_dir, lipschitz_weight=0.1
+                )
 
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             # RE-EVALUATE MASK (OUTLIER FILTERING)
-            # ------------------------------------------------------------------
-            debug_info(f"Recomputing mask for '{name}' using error threshold {error_threshold}...")
+            # --------------------------------------------------------------
+            debug_info(f"Recomputing mask for '{name}'...")
+            # is_well_explained now has the dimension shield
             mask, errors = is_well_explained(model, params_tensor, error_threshold)
 
-            debug_info(
-                f"[{name} Iter {iteration+1}] Kept "
-                f"{mask.sum().item()}/{len(parameters)} examples."
-            )
+            debug_info(f"[{name} Iter {iteration+1}] Kept {mask.sum().item()}/{len(parameters)} samples.")
 
-            # --- NEW PLOTTING LOGIC ---
+            # --- PLOTTING LOGIC ---
             if plot_error_distribution:
-                errors_np = errors.cpu().numpy()
-                
-                fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
-                # Plot histogram of all errors
-                ax.hist(
-                    errors_np, 
-                    bins=50, 
-                    alpha=0.7, 
-                    label='All Sample Errors'
-                )
-                
-                # Plot histogram of errors *below* the threshold (the ones we keep)
-                # ax.hist(
-                #     errors_np[mask.cpu().numpy()], 
-                #     bins=25, 
-                #     alpha=0.9, 
-                #     label=f'Kept (Error < {error_threshold})'
-                # )
-                
-                # Draw the threshold line
-                ax.axvline(
-                    error_threshold, 
-                    color='red', 
-                    linestyle='--', 
-                    linewidth=2, 
-                    label=f'Error Threshold ({error_threshold})'
-                )
-                
-                ax.set_title(
-                    f'"{name}" - Error Distribution (Iter {iteration+1})'
-                )
-                ax.set_xlabel("Max Reconstruction Error (Normalized Space)")
-                ax.set_ylabel("Sample Count")
-                ax.legend()
-                ax.grid(True, linestyle='--', alpha=0.5)
-                fig.tight_layout()
+                try:
+                    errors_np = errors.cpu().numpy()
+                    fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
+                    ax.hist(errors_np, bins=50, alpha=0.7, color='skyblue', label='Sample Errors')
+                    ax.axvline(error_threshold, color='red', linestyle='--', linewidth=2, label=f'Limit ({error_threshold})')
+                    ax.set_title(f'"{name}" - Error Distribution (Iter {iteration+1})')
+                    ax.set_xlabel("Max Absolute Error (Normalized)")
+                    ax.set_ylabel("Frequency")
+                    ax.legend()
+                    ax.grid(True, linestyle='--', alpha=0.5)
+                    fig.tight_layout()
 
-                # --- NEW SAVE LOGIC ---
-                if save_dir:
-                    try:
+                    if save_dir:
                         save_path = Path(save_dir)
                         save_path.mkdir(parents=True, exist_ok=True)
-                        # Include iteration in filename
-                        safe_filename = make_safe_filename(
-                            name, suffix=f"error_iter_{iteration+1}"
-                        ) + ".png"
+                        safe_filename = make_safe_filename(name, suffix=f"err_iter_{iteration+1}") + ".png"
                         fig.savefig(save_path / safe_filename)
-                        debug_success(f"Saved error plot to {save_path / safe_filename}")
-                    except Exception as e:
-                        debug_error(f"Failed to save error plot for {name}: {e}")
-                # --- END NEW SAVE LOGIC ---
-
-                plt.show()
-                plt.close(fig)
-                
-            # --- END NEW PLOTTING LOGIC ---
+                    
+                    plt.show()
+                    plt.close(fig)
+                except Exception as e:
+                    debug_error(f"Plotting failed for {name}: {e}")
 
         # ----------------------------------------------------------------------
         # STORE FINAL MODEL
         # ----------------------------------------------------------------------
-        if model is None:
-            debug_error(f"No model produced for '{name}'. Skipping.")
-            continue
-
-        if not mask.any():
-            debug_error(f"All samples rejected for '{name}'. Not storing model.")
-            continue
-
-        trained_models[name] = model
-        debug_success(f"Stored final model for '{name}'.")
+        if model is not None and mask.any():
+            trained_models[name] = model
+            debug_success(f"Stored final model for '{name}'.")
+        else:
+            debug_error(f"No valid model or all samples rejected for '{name}'.")
 
     debug_success(f"Finished abstraction search. Created {len(trained_models)} models.")
     return trained_models
-
 
 # ==============================================================================
 # --- FIXED INTEGRATION FUNCTION ---
