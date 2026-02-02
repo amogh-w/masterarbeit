@@ -138,3 +138,23 @@ class Union:
 
     def serialize(self):
         return (Union, ([], [self.left, self.right]))
+    
+class SymRef:
+    """Represents a reflection symmetry across an axis."""
+    def __init__(self, child, axis):
+        self.child = child
+        self.axis = axis # e.g., "AX", "AY", "AZ"
+
+    def __repr__(self):
+        return f"sym_ref({self.child}, {self.axis})"
+
+class SymTrans:
+    """Represents a translational symmetry (repetition)."""
+    def __init__(self, child, axis, count, spacing):
+        self.child = child
+        self.axis = axis
+        self.count = count
+        self.spacing = spacing
+
+    def __repr__(self):
+        return f"sym_trans({self.child}, {self.axis}, {self.count}, {self.spacing})"
