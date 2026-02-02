@@ -1647,26 +1647,32 @@ from abstractionssymh.dsl_nodes import (
 )
 from abstractionssymh.debug_utils import debug_info, debug_error, debug_success
 
+# --- Updated Schema with Adjusted Costs ---
 class Shape(Expr):
-    @method(cost=10) 
+    @method(cost=100) # Unions are now very expensive
     def __add__(self, other: Shape) -> Shape: ...
 
-@function(cost=1)
+@function(cost=100) # High cost makes raw boxes undesirable
 def box(label: f64Like) -> Shape: ...
 
-@function(cost=0) 
+@function(cost=0) # Abstractions are "Free" to ensure they are kept
 def abs_node(name: StringLike, params: Vec[f64], children: Vec[Shape]) -> Shape: ...
 
-@function(cost=1)
+@function(cost=10) # Lower than Union, but high enough to prune no-ops
 def translate(s: Shape, x: f64Like, y: f64Like, z: f64Like) -> Shape: ...
-@function(cost=1)
+
+@function(cost=10)
 def rotate(s: Shape, x: f64Like, y: f64Like, z: f64Like, w: f64Like) -> Shape: ...
-@function(cost=1)
+
+@function(cost=10)
 def scale(s: Shape, sx: f64Like, sy: f64Like, sz: f64Like) -> Shape: ...
-@function(cost=1)
+
+@function(cost=1) # Symmetries are cheap to encourage folding
 def sym_ref(s: Shape, nx: f64Like, ny: f64Like, nz: f64Like, px: f64Like, py: f64Like, pz: f64Like) -> Shape: ...
+
 @function(cost=1)
 def sym_rot(s: Shape, ax: f64Like, ay: f64Like, az: f64Like, cx: f64Like, cy: f64Like, cz: f64Like, n: f64Like) -> Shape: ...
+
 @function(cost=1)
 def sym_trans(s: Shape, dx: f64Like, dy: f64Like, dz: f64Like, n: f64Like) -> Shape: ...
 
@@ -1723,6 +1729,7 @@ def from_egglog_string(egg_expr, singleton_models, pair_models):
     from abstractionssymh.abstraction_utils import Abstraction
     import re
 
+    # Patch Union operator
     def dsl_add(self, other): return Union(self, other)
     for cls in [Box, Scale, Rotate, Translate, Union, SymRef, SymRot, SymTrans, Abstraction]:
         cls.__add__ = dsl_add
@@ -1735,29 +1742,45 @@ def from_egglog_string(egg_expr, singleton_models, pair_models):
         "sym_ref": lambda c, nx, ny, nz, px, py, pz: SymRef(c, [nx, ny, nz], [px, py, pz]),
         "sym_rot": lambda c, ax, ay, az, cx, cy, cz, n: SymRot(c, [ax, ay, az], [cx, cy, cz], int(n)),
         "sym_trans": lambda c, dx, dy, dz, n: SymTrans(c, [dx, dy, dz], int(n)),
-        "add": lambda a, b: Union(a, b),
-        # Handles the conversion of Egglog Vecs back to Python lists
-        "vec": lambda *args: list(args),
         "abs_node": lambda name, params, children: Abstraction(
             pattern_name=name, compressed_params=params,
             model=pair_models.get(name) or singleton_models.get(name),
             children=children
-        )
+        ),
+        "Vec": lambda *args: list(args), 
+        "f64": lambda x: float(x),       
+        "String": lambda x: str(x),      
     }
+
     try:
         expr_str = str(egg_expr).strip()
-        assignments = re.findall(r"^(_\w+)\s*=\s*(.*)$", expr_str, re.MULTILINE)
-        # Filters out intermediate assignments for the final eval body
-        body_lines = [l for l in expr_str.splitlines() if not re.match(r"^_\w+\s*=", l.strip()) and l.strip()]
         
-        for var_name, var_val in assignments:
-            namespace[var_name] = eval(var_val.strip(), {"__builtins__": {}}, namespace)
-            
-        return eval("\n".join(body_lines).strip(), {"__builtins__": {}}, namespace)
-    except Exception: return None
+        # 1. Strip Type Subscripts (Vec[f64] -> Vec)
+        expr_str = re.sub(r"Vec\[.*?\]", "Vec", expr_str)
+        
+        # 2. Extract assignments vs final expression
+        lines = expr_str.splitlines()
+        assignment_block = ""
+        final_expression = ""
+        
+        for line in lines:
+            if "=" in line and line.strip().startswith("_"):
+                assignment_block += line + "\n"
+            else:
+                final_expression += line + " " # Keep multi-line expressions together
+        
+        # 3. Execute assignments to populate namespace
+        if assignment_block:
+            exec(assignment_block, {"__builtins__": {}}, namespace)
+        
+        # 4. Evaluate the final consolidated expression
+        return eval(final_expression.strip(), {"__builtins__": {}}, namespace)
+        
+    except Exception as e:
+        debug_error(f"Parser Error: {e} | String: {expr_str}")
+        # return None
 
-# --- Ruleset ---
-
+# --- Updated Ruleset ---
 sem_rules = ruleset()
 
 @sem_rules.register
@@ -1765,19 +1788,31 @@ def _rules_def(
     s: Shape, s2: Shape, s3: Shape, name: String, p: Vec[f64], c: Vec[Shape],
     x1: f64, y1: f64, z1: f64, x2: f64, y2: f64, z2: f64, sx: f64, sy: f64, sz: f64, w: f64
 ):
-    # Abstraction mirrored symmetry
-    yield rewrite(translate(abs_node(name, p, c), x1, y1, z1) + translate(abs_node(name, p, c), f64(-1.0) * x1, y1, z1)).to(
+    # 1. Abstraction mirrored symmetry 
+    # This is the "Identity" check for VAE nodes - folds two identical VAE blocks into one SymRef
+    yield rewrite(
+        translate(abs_node(name, p, c), x1, y1, z1) + 
+        translate(abs_node(name, p, c), f64(-1.0) * x1, y1, z1)
+    ).to(
         sym_ref(translate(abs_node(name, p, c), x1, y1, z1), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     )
-    # L0 mirrored symmetry
+    
+    # 2. L0 mirrored symmetry
     yield rewrite(translate(s, x1, y1, z1) + translate(s, f64(-1.0) * x1, y1, z1)).to(
         sym_ref(translate(s, x1, y1, z1), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     )
-    # Factor common translations
-    yield rewrite(translate(s, x1, y1, z1) + translate(s2, x1, y1, z1)).to(translate(s + s2, x1, y1, z1))
-    # Combine nested translations
-    yield rewrite(translate(translate(s, x1, y1, z1), x2, y2, z2)).to(translate(s, x1 + x2, y1 + y2, z1 + z2))
-    # Remove no-ops
+
+    # 3. Factor common translations (Works for Abstractions too!)
+    yield rewrite(translate(s, x1, y1, z1) + translate(s2, x1, y1, z1)).to(
+        translate(s + s2, x1, y1, z1)
+    )
+
+    # 4. Combine nested translations (Flattening)
+    yield rewrite(translate(translate(s, x1, y1, z1), x2, y2, z2)).to(
+        translate(s, x1 + x2, y1 + y2, z1 + z2)
+    )
+
+    # 5. Remove no-ops
     yield rewrite(translate(s, 0.0, 0.0, 0.0)).to(s)
     yield rewrite(scale(s, 1.0, 1.0, 1.0)).to(s)
     yield rewrite(rotate(s, 0.0, 0.0, 0.0, 1.0)).to(s)
@@ -1823,7 +1858,6 @@ def integrate_abstractions(
                 else:
                     rebuilt_children.append(c)
             
-            # Rebuild node with optimized children
             if isinstance(node, Union): current_node = Union(rebuilt_children[0], rebuilt_children[1])
             elif isinstance(node, SymRef): current_node = SymRef(rebuilt_children[0], plane_normal=node.plane, point_on_plane=node.point_on_plane)
             elif isinstance(node, SymRot): current_node = SymRot(rebuilt_children[0], axis=node.axis, center=node.center, n_fold=node.n)
@@ -1839,40 +1873,45 @@ def integrate_abstractions(
     # ------------------------------------------------------------------
     # 2. SYMBOLIC REFACTORING (Egglog Layer)
     # ------------------------------------------------------------------
-    try:
-        egraph = EGraph()
-        # Ensure to_egglog and from_egglog_string are imported/defined in the file scope
-        egg_shape = egraph.let("subtree", to_egglog(current_node))
-        
-        # Run rules to find symmetries and factor out transforms
-        egraph.run(sem_rules.saturate())
-        
-        # Extract the lowest cost representation
-        extracted, cost = egraph.extract(egg_shape, include_cost=True)
-        
-        # Convert back to Python DSL
-        refined = from_egglog_string(extracted, singleton_models, pair_models)
-        
-        if refined is not None and str(refined) != str(current_node):
-            if detailed_debug: print(f"{indent}[EGGLOG] Improved subtree cost (Extracted Cost: {cost})")
-            current_node = refined
-    except Exception as e:
-        if detailed_debug: print(f"{indent}[WARN] Egglog refactor skipped: {e}")
+    # try:
+    print(f"{indent}[EGGLOG] Attempting refactor on subtree...")
+
+    egraph = EGraph()
+    egg_shape = egraph.let("subtree", to_egglog(current_node))
+    egraph.run(sem_rules.saturate())
+    extracted, cost = egraph.extract(egg_shape, include_cost=True)
+    print("extracted", extracted)
+    refined = from_egglog_string(extracted, singleton_models, pair_models)
+    print("refined", refined)
+
+    print(refined)
+    
+    if refined is not None and str(refined) != str(current_node):
+        if detailed_debug: print(f"{indent}[EGGLOG] Improved subtree cost (Extracted Cost: {cost})")
+        current_node = refined
+    # except Exception as e:
+    #     if detailed_debug: print(f"{indent}[WARN] Egglog refactor skipped: {e}")
 
     # ------------------------------------------------------------------
-    # 3. VAE COMPRESSION LAYER
+    # 3. VAE COMPRESSION LAYER (With Detailed Debug)
     # ------------------------------------------------------------------
     
-    def check_geometric_fidelity(original_node, candidate_abstraction):
+    def check_geometric_fidelity(original_node, candidate_abstraction, label):
         try:
             pc_orig = get_point_cloud_from_dsl(original_node, points_per_box=points_per_check)
             pc_cand = get_point_cloud_from_dsl(candidate_abstraction, points_per_box=points_per_check)
             if len(pc_orig) == 0 or len(pc_cand) == 0: return False
             dist = calculate_chamfer_distance(pc_orig, pc_cand)
+            
+            if detailed_debug:
+                status = "PASS" if dist <= geometric_threshold else "FAIL"
+                print(f"{indent}  [GEO-CHECK] {label} | Chamfer: {dist:.6f} (Limit: {geometric_threshold}) -> {status}")
+            
             return dist <= geometric_threshold
-        except Exception: return False
+        except Exception as e:
+            if detailed_debug: print(f"{indent}  [GEO-ERROR] {e}")
+            return False
 
-    # Get candidate child nodes for VAE pattern matching
     child_nodes = []
     if isinstance(current_node, Abstraction):
         child_nodes = current_node.children
@@ -1899,13 +1938,16 @@ def integrate_abstractions(
             if hasattr(model, 'input_dim') and combined.shape[1] == model.input_dim:
                 normalized = (combined - model.data_mean_) / model.data_std_
                 output = model(normalized)
-                # Handle AE (latent, recon) vs VAE (recon, mu)
                 recon, encoding = (output[1], output[0]) if not isinstance(output, tuple) or len(output) != 2 else (output[0], output[1])
                 
-                if torch.max(torch.abs(recon - normalized)).item() < error_threshold:
+                err = torch.max(torch.abs(recon - normalized)).item()
+                if detailed_debug:
+                    print(f"{indent}[VAE-TRY] PAIR {pair_sig} | Param Error: {err:.6f} (Limit: {error_threshold})")
+                
+                if err < error_threshold:
                     candidate = Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
-                    if check_geometric_fidelity(current_node, candidate):
-                        if detailed_debug: print(f"{indent}[VAE] Abstracted PAIR: {pair_sig}")
+                    if check_geometric_fidelity(current_node, candidate, pair_sig):
+                        if detailed_debug: print(f"{indent}[VAE-SUCCESS] Abstracted PAIR: {pair_sig}")
                         return candidate
 
     # --- VAE SINGLETON LOGIC ---
@@ -1920,13 +1962,18 @@ def integrate_abstractions(
                 output = model(normalized)
                 recon, encoding = (output[1], output[0]) if not isinstance(output, tuple) or len(output) != 2 else (output[0], output[1])
 
-                if torch.max(torch.abs(recon - normalized)).item() < error_threshold:
+                err = torch.max(torch.abs(recon - normalized)).item()
+                if detailed_debug:
+                    print(f"{indent}[VAE-TRY] SINGLETON {name} | Param Error: {err:.6f} (Limit: {error_threshold})")
+
+                if err < error_threshold:
                     candidate = Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
-                    if check_geometric_fidelity(current_node, candidate):
-                        if detailed_debug: print(f"{indent}[VAE] Abstracted SINGLETON: {name}")
+                    if check_geometric_fidelity(current_node, candidate, name):
+                        if detailed_debug: print(f"{indent}[VAE-SUCCESS] Abstracted SINGLETON: {name}")
                         return candidate
 
     return current_node
+
 # def integrate_abstractions(
 #     node,
 #     singleton_models,
