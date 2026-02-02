@@ -1,0 +1,31 @@
+\chapter{Related Work}\label{sec:related-work}
+Previous research that is relevant to our work can be roughly categorized into
+three fields: The mathematical representation of smooth surfaces
+(\cref{sec:surface-representation}), the segmentation of surfaces into suitable
+parametric domains (\cref{sec:quad-layout-generation}), and the automatic
+approximation of 3D objects by a simplified surface model
+(\cref{sec:spline-surface-fitting}).
+
+\section{Surface Representation}\label{sec:surface-representation}
+\index{B{\'e}zier curve}B{\'e}zier curves~\cite{Cas63,Bez67} and their bivariate
+generalization, \index{tensor product Bezier surface@tensor product B{\'e}zier
+surface}tensor product B{\'e}zier surfaces~\cite{Boo62}, provide a simple
+parametric representation of polynomial curves and surfaces. Joining multiple
+B{\'e}zier surfaces with $C^r$ continuity produces smooth \index{spline
+surface}spline surfaces with a regular layout which are generalized by
+\index{B-Spline surface}B-Spline surfaces~\cite{GR74}. \index{NURBS
+surface}NURBS surfaces~\cite{Ver75} further broaden this definition by allowing
+weighted B{\'e}zier points, thus providing a unified representation of both
+piecewise polynomial surfaces and \index{conic sections}conic sections.  One
+restriction of NURBS, the strictly grid-like arrangement of knots in the
+parameter domain, is lifted by \index{T-Splines}T-Splines~\cite{SZB+03} which
+allow partial rows and columns of knots, hence providing a more compact
+representation for tensor product spline surfaces.
+
+\rlipsum[3]
+
+\section{Quad Layout Generation}\label{sec:quad-layout-generation}
+\rlipsum[3]
+
+\section{Spline Surface Fitting}\label{sec:spline-surface-fitting}
+\rlipsum[3]

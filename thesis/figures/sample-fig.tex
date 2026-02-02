@@ -1,0 +1,54 @@
+  % 60, -25
+  % 0, 75
+  % 60, 25
+  %\tikz\draw (0, 0) rectangle (8cm, 2.5cm);\par
+  \begin{tikzpicture}[x={(.6cm, -.25cm)}, y={(0cm, .75cm)}, z={(.6cm, .25cm)}]
+    \begin{scope}[scale=2]
+      \coordinate (a1) at ( 1,   1,   -1);
+      \coordinate (a2) at ( 1,   1.5,  1);
+      \coordinate (a3) at (-1,   1,    1);
+      \coordinate (a4) at ( 1.5, 0,    0);
+      \coordinate (a5) at (-1,   1.5, -1);
+      \coordinate (pa1) at ( 1,   -.2, -1);
+      \coordinate (pa2) at ( 1,   -.2,  1);
+      \coordinate (pa3) at (-1,   -.2,  1);
+      \coordinate (pa4) at ( 1.5, -.2,  0);
+      \coordinate (pa5) at (-1,   -.2, -1);
+      \coordinate (o)   at ( 0,   -.2, -2);
+    \end{scope}
+      \path[draw=black,->,>=Latex] (o) -- ($(o)+(.8, 0, 0)$);
+      \path[draw=black,->,>=Latex] (o) -- ($(o)+(0, .8, 0)$);
+      \path[draw=black,->,>=Latex] (o) -- ($(o)+(0, 0, -.8)$);
+      \path (o) ++(1, 0, 0) node {$x$};
+      \path (o) ++(0, 1, 0) node {$y$};
+      \path (o) ++(0, 0, -1) node {$z$};
+      \path[fill=black!10!white]
+            (pa1) -- (pa2) -- (pa3)
+            (pa1) -- (pa3) -- (pa5)
+            (pa1) -- (pa4) -- (pa2);
+      \path[draw=black!60!white,thick,dashed]
+        (a1) -- (pa1)
+        (a2) -- (pa2)
+        (a3) -- (pa3)
+        (a4) -- (pa4)
+        (a5) -- (pa5);
+      %\path[draw=black!15!white] (pa1) -- (pa2) (pa1) -- (pa3);
+      \draw[fill=white] (a1) -- (a2) -- (a3) -- cycle;
+      \draw[fill=black!30!white] (a1) -- (a4) -- (a2) -- cycle;
+      \draw[fill=black!15!white] (a1) -- (a3) -- (a5) -- cycle;
+      \node[left] at (a1) {$\v a_1$};
+      \node[right] at (a2) {$\v a_2$};
+      \node[above] at (a3) {$\v a_3$};
+      \node[right] at (a4) {$\v a_4$};
+      \node[above] at (a5) {$\v a_5$};
+      \def\blob#1{\path[fill=black] (#1) circle (2pt);}
+      \blob{a1}
+      \blob{a2}
+      \blob{a3}
+      \blob{a4}
+      \blob{a5}
+      \def\bary#1#2#3#4{\node at ($.33333*(#1) + .33333*(#2) + .33333*(#3)$) {#4};}
+      \bary{a1}{a2}{a3}{$T_1$}
+      \bary{a1}{a2}{a4}{$T_2$}
+      \bary{a1}{a3}{a5}{$T_3$}
+  \end{tikzpicture}

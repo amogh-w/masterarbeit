@@ -1,0 +1,47 @@
+\chapter{Introduction}
+The most significant discernable feature of a
+three-dimensional object is the shape of its surface. For the digital
+processing, manipulation and storage of surface data, a variety of
+representations are used, most notably polygon meshes where the object surface
+is approximated by a network of a finite number of polygons. Polygon meshes,
+especially triangle meshes, are ubiquitous in geometry processing and rendering
+and are a common interchange format between different applications and
+algorithms.
+
+\begin{figure}[htb]
+  \begin{center}
+  \includegraphics[width=6cm]{figures/krabby-patty}
+  \end{center}
+  \caption{The original Krabby Patty manufactured using the standard approach.
+    (Figure courtesy of Nickelodeon Animation Studios.)}
+\end{figure}
+
+In the context of 3D modeling and computer aided design
+(\index{CAD}\emph{CAD}), polygon meshes are less popular due to their
+inability to accurately represent smoothly curved surfaces. Instead, spline
+representations that construct shapes from piecewise polynomial surfaces are
+used. Spline representations are desirable for a number of reasons:
+\begin{itemize}
+  \item \emph{Abstraction capacity}: Where polygon meshes might require
+    hundreds or thousands of faces to approximate a rounded feature, spline
+    surfaces can accurately represent such features often by a single patch
+    with a handful of control points, hence offering more intuitive editing
+    capabilities to a designer.
+  \item \emph{Built-in smoothness}: Spline surfaces retain their desired
+    smoothness properties when their control points are modified.
+  \item \emph{Compact storage}: Due to the sparse number of control points,
+    spline surfaces typically achieve a lower memory footprint than polygonal
+    representations.
+\end{itemize}
+
+Spline representations have been used for a variety of applications including
+industrial, automotive and aerospace design, architecture, entertainment, \etc.
+
+\begin{figure}[htb]
+  \begin{center}
+  \input{figures/sample-fig}
+  \end{center}
+  \caption{A sample figure.}
+\end{figure}
+
+\rlipsum[4]

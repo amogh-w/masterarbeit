@@ -1,0 +1,45 @@
+\documentclass{thesis}
+
+\usepackage{rlipsum} % Only needed for Lorem Ipsum dummy text.
+
+\thesisTitle{An Improved Approach to Manufacturing the Perfect Krabby Patty}
+\thesisType{Master Thesis}
+\thesisAuthor{Spongebob Squarepants}
+\thesisStudentID{123456}
+\thesisMonth{August 2015}
+\thesisAdvisor{Patrick}
+\thesisPrimaryReviewer{Prof.\ Dr.\ Leif Kobbelt}
+\thesisSecondaryReviewer{Eugene H.\ Krabs}
+
+\begin{document}
+\makeFrontMatter
+
+\chapter*{}
+\begin{center}
+    \textbf{Abstract}\\
+\end{center}
+Here goes the abstract.
+
+\mainmatter
+\input{introduction.tex}
+\input{related-work.tex}
+\begin{appendices}
+\input{sample-appendix.tex}
+\end{appendices}
+\cleardoublepage
+
+\backmatter
+\phantomsection
+\addcontentsline{toc}{chapter}{Bibliography}
+\begingroup
+\setlength{\emergencystretch}{8em}
+\printbibliography{}
+\endgroup
+
+\cleardoublepage
+\phantomsection
+\addcontentsline{toc}{chapter}{Index}
+\printindex
+\cleardoublepage
+
+\end{document}

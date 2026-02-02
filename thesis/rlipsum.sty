@@ -1,0 +1,17 @@
+% rlipsum
+%
+% Usage:
+% \rlipsum    -- Inserts one random paragraph of Lorem Ipsum text
+% \rlipsum[n] -- Inserts n random paragraphs of Lorem Ipsum text
+%
+
+\usepackage{lipsum}
+\usepackage[counter=rlipsumrand, first=1, last=150]{lcg}
+\usepackage{forloop}
+
+\newcommand{\rlipsumsingle}{\rand\lipsum[\arabic{rlipsumrand}]}
+
+\newcounter{rlipsumnumparas}
+\newcommand{\rlipsum}[1][1]{
+  \forloop{rlipsumnumparas}{0}{\value{rlipsumnumparas}<#1}{\rlipsumsingle}
+}

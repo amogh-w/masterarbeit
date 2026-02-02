@@ -1,0 +1,58 @@
+\chapter{Thin Plate Energy Discretization}\label{sec:thin-plate-energy-discretization}
+\index{thin plate energy!discretization}Consider a single \index{tensor product
+Bezier surface@tensor product B{\'e}zier surface}tensor product B{\'e}zier surface
+$\v{b} : [0,1]^2 \to \mathds{A}$ of degree $(n,n)$. The parametric thin plate
+energy for $\v{b}$ is given by
+\begin{equation}\label{eq:tpe-single}
+  E = \bigint_0^1 \!\!\! \bigint_0^1 \left\| \v{b_{uu}}(u,v) \right\|_2^2 + 2 \left\| \v{b_{uv}}(u,v) \right\|_2^2 + \left\| \v{b_{vv}}(u,v) \right\|_2^2 \intd{u} \intd{v}
+\end{equation}
+where $\v{b_{uu}}$, $\v{b_{uv}}$, $\v{b_{vv}}$ indicate the (mixed)
+second-order partial derivatives of $\v{b}$ \wrt\ the parameters $u$ and $v$.
+We can split the integral in \cref{eq:tpe-single} into three terms
+\begin{equation*}
+  E = E_\mathrm{uu} + 2 \cdot E_\mathrm{uv} + E_\mathrm{vv}
+\end{equation*}
+with
+\begin{equation}\label{eq:tpe-single-uu}
+  E_\mathrm{uu} = \bigint_0^1 \!\!\! \bigint_0^1 \left\| \v{b_{uu}}(u,v) \right\|_2^2  \intd{u} \intd{v}
+\end{equation}
+\etc. Since the terms $E_\mathrm{uu}$, $E_\mathrm{uv}$, $E_\mathrm{vv}$ are
+quite similar, we focus our attention in the following on the derivation of
+$E_\mathrm{uu}$. If we assume that the vector space $\mathds{V}$ underlying our affine
+space $\mathds{A}$ is represented by a $D$-dimensional cartesian coordinate space
+$\reals^D$, the squared norm of a vector $\v{v} \in \mathds{V}$ just evaluates to
+a sum of squares:
+\begin{equation*}
+  \left\| \v{v} \right\|_2^2 = \sum_{d=1}^D \left( \v{v}^{[d]} \right)^2 \eqend ,
+\end{equation*}
+allowing us to split the integral in \cref{eq:tpe-single-uu} again into $D$
+real-valued terms which can be integrated independently. Hence, in the
+following, we pretend $\v{b}$ just consists of a single real-valued component,
+simplifying \cref{eq:tpe-single-uu} to
+\begin{equation*}
+  E_\mathrm{uu} = \bigint_0^1 \!\!\! \bigint_0^1 \v{b_{uu}}(u,v)^2  \intd{u} \intd{v} \eqend .
+\end{equation*}
+We can now expand the partial derivatives of the B{\'e}zier surface:
+\begin{align*}
+  &\phantom{={\ }} \bigint_0^1 \!\!\! \bigint_0^1 \left( \frac{\partial^2}{\partial u^2} \sum_{i=0}^n \sum_{j=0}^n B_i^n(u) B_j^n(v) \v{b}_{ij} \right)^2 \intd{u} \intd{v} \\
+  &= \bigint_0^1 \!\!\! \bigint_0^1 \left( n (n-1) \frac{\partial^2}{\partial u^2} \sum_{i=0}^{n-2} \sum_{j=0}^n B_i^{n-2}(u) B_j^n(v) \Delta^{20} \v{b}_{ij} \right)^2 \intd{u} \intd{v}
+\end{align*}
+where the $\Delta^{20}$ denote forward differences on the B{\'e}zier grid.
+Multiplying out the squared term yields
+\begin{align*}
+  &\phantom{={\ }} n^2 (n-1)^2 \bigint_0^1 \!\!\! \bigint_0^1 \sum_{i,k=0}^{n-2} \sum_{j,l=0}^n B_i^{n-2}(u) B_j^n(v) B_k^{n-2}(u) B_l^n(v) \Delta^{20} \v{b}_{ij} \Delta^{20} \v{b}_{kl} \intd{u} \intd{v} \\
+  &= n^2 (n-1)^2 \sum_{i,k=0}^{n-2} \sum_{j,l=0}^n \Delta^{20} \v{b}_{ij} \Delta^{20} \v{b}_{kl} \bigint_0^1 \!\!\! \bigint_0^1 B_i^{n-2}(u) B_j^n(v) B_k^{n-2}(u) B_l^n(v) \intd{u} \intd{v} \\
+  &= n^2 (n-1)^2 \sum_{i,k=0}^{n-2} \sum_{j,l=0}^n \Delta^{20} \v{b}_{ij} \Delta^{20} \v{b}_{kl} \bigint_0^1 B_i^{n-2}(u) B_k^{n-2}(u) \intd{u} \bigint_0^1 B_j^n(v)  B_l^n(v) \intd{v} \\
+  &= n^2 (n-1)^2 \sum_{i,k=0}^{n-2} \sum_{j,l=0}^n \Delta^{20} \v{b}_{ij} \Delta^{20} \v{b}_{kl} \cdot \mathcal{B}_{i,k}^{n-2} \cdot \mathcal{B}_{j,l}^n
+  \eqend .
+\end{align*}
+Note how we have shortened the separated integral factors to
+$\mathcal{B}_{i,k}^{n-2}$ and $\mathcal{B}_{j,l}^n$ which have the same general
+form
+\begin{align}
+  \mathcal{B}_{i,j}^n
+  &= \bigint_0^1 B_i^n(t) B_j^n(t) \intd{t} \eqend \nonumber \\
+  &= \bigint_0^1 {n \choose i} t^i (1-t)^{n-i} {n \choose j} t^j (1-t)^{n-j} \nonumber \\
+  &= {n \choose i} {n \choose j} \bigint_0^1 t^{i+j} (1-t)^{2n-i-j} \label{eq:tpe-hidden-beta}
+  \eqend .
+\end{align}
