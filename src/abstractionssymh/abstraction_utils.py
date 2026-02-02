@@ -1053,52 +1053,95 @@ def prepare_autoencoder_train_data(
     return dataloader
 
 
-def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD):
-    """Checks if parameters are reconstructed accurately, with automatic dimension detection."""
+def is_well_explained(model, parameters_tensor, error_threshold=ERROR_THRESHOLD, detailed_debug=True):
+    """
+    Robust reconstruction check for AE, PCA, and VAE models.
+    
+    1. Dimension Shield: Prevents crashes from Egglog-refactored shapes.
+    2. Smart Extraction: Automatically finds the reconstruction in output tuples.
+    3. Telemetry: Detailed logs to identify why abstractions fail.
+    """
     model.eval()
     device = parameters_tensor.device
     batch_size = parameters_tensor.shape[0]
+    input_dim = parameters_tensor.shape[1]
     
-    # --- ULTIMATE DIMENSION SHIELD ---
-    # Detect expected input dim from the model's first layer weights
-    expected_dim = None
-    try:
-        # Most of your models have an encoder.0 or fc1
+    # --- 1. DIMENSION SHIELD ---
+    # Prevents "size mismatch" crash when Egglog changes parameter counts
+    expected_dim = getattr(model, 'input_dim', None)
+    if expected_dim is None:
+        # Fallback: try to find dim from the first layer weights
         for layer in model.modules():
             if isinstance(layer, torch.nn.Linear):
                 expected_dim = layer.in_features
                 break
-    except:
-        pass
 
-    if expected_dim is not None and parameters_tensor.shape[1] != expected_dim:
-        # If dimensions don't match, return "Failure" mask immediately
+    if expected_dim is not None and input_dim != expected_dim:
+        if detailed_debug:
+            print(f"  [DEBUG-SHIELD] REJECT: Dim mismatch. Model expects {expected_dim}, but got {input_dim}")
         return torch.zeros(batch_size, dtype=torch.bool, device=device), \
                torch.ones(batch_size, device=device) * 1e6
 
     with torch.no_grad():
-        # Normalization
-        normalized_input = (parameters_tensor - model.data_mean_) / model.data_std_
-        output = model(normalized_input)
-        
-        # Handle VAE vs AE output shapes
-        if isinstance(output, tuple):
-            reconstructions = output[0] # (recon, mu, logvar)
-        else:
-            reconstructions = output # Standard AE
-            # If AE returns (latent, recon) as a list
-            if hasattr(output, '__len__') and not isinstance(output, torch.Tensor) and len(output) > 1:
-                reconstructions = output[1]
+        try:
+            # --- 2. NORMALIZATION ---
+            # Explicitly move stats to the current device
+            mean = model.data_mean_.to(device)
+            std = model.data_std_.to(device)
+            
+            # Avoid division by zero
+            std = torch.clamp(std, min=1e-6)
+            
+            normalized_input = (parameters_tensor - mean) / std
+            
+            if detailed_debug:
+                print(f"  [DEBUG-INPUT] Dim: {input_dim} | Raw Max: {parameters_tensor.max():.2f}")
 
-        # Final safety: if the math is about to happen on mismatched sizes, catch it
-        if reconstructions.shape != normalized_input.shape:
+            # --- 3. FORWARD PASS ---
+            output = model(normalized_input)
+            
+            # --- 4. ROBUST EXTRACTION ---
+            # AEs return (latent, recon)
+            # VAEs return (recon, mu) or (recon, mu, logvar, h)
+            # PCAModels return (latent, recon)
+            reconstructions = None
+            if isinstance(output, tuple):
+                # Search the tuple for the tensor that matches the input shape
+                for i, part in enumerate(output):
+                    if torch.is_tensor(part) and part.shape == normalized_input.shape:
+                        reconstructions = part
+                        if detailed_debug: print(f"  [DEBUG-GET] Found reconstruction at index [{i}]")
+                        break
+                # Fallback to index 0 if loop fails
+                if reconstructions is None: reconstructions = output[0]
+            else:
+                reconstructions = output
+
+            # --- 5. ERROR CALCULATION ---
+            if reconstructions is None or reconstructions.shape != normalized_input.shape:
+                if detailed_debug: print(f"  [DEBUG-FAIL] Shape mismatch in reconstruction.")
+                return torch.zeros(batch_size, dtype=torch.bool, device=device), \
+                       torch.ones(batch_size, device=device) * 1e6
+
+            # Calculate Max Absolute Error per sample (Normalized space)
+            abs_err = torch.abs(reconstructions - normalized_input)
+            error, _ = torch.max(abs_err, dim=-1)
+            
+            if detailed_debug:
+                print(f"  [DEBUG-ERR] Max Batch Err: {error.max().item():.6f} vs Threshold: {error_threshold}")
+
+            # Return boolean mask and the error values
+            well_explained = error < error_threshold
+            
+            if detailed_debug and well_explained.any():
+                print(f"  [DEBUG-SUCCESS] {well_explained.sum().item()} samples matched!")
+                
+            return well_explained, error
+
+        except Exception as e:
+            if detailed_debug: print(f"  [DEBUG-CRITICAL] Math error in is_well_explained: {e}")
             return torch.zeros(batch_size, dtype=torch.bool, device=device), \
                    torch.ones(batch_size, device=device) * 1e6
-
-        error, _ = torch.max(torch.abs(reconstructions - normalized_input), dim=-1)
-    
-    well_explained = error < error_threshold
-    return well_explained, error
 
 def make_safe_filename(name: str, suffix: str = "") -> str:
     """Create a safe, sanitized filename from a string.
@@ -1736,6 +1779,41 @@ def _rules_def(
     yield rewrite(scale(s, 1.0, 1.0, 1.0)).to(s)
     yield rewrite(rotate(s, 0.0, 0.0, 0.0, 1.0)).to(s)
 
+# --- ADD THESE TO YOUR EXISTING sem_rules.register ---
+
+    # 1. EXPAND TRANSLATION OVER ABSTRACTIONS
+    # This allows Egglog to move a translation "through" an abstraction
+    # to find common ground with other nodes.
+    yield rewrite(translate(abs_node(name, p, c), x1, y1, z1)).to(
+        abs_node(name, p, [translate(child, x1, y1, z1) for child in c])
+    )
+
+    # 2. EXPAND SCALE OVER ABSTRACTIONS
+    yield rewrite(scale(abs_node(name, p, c), sx, sy, sz)).to(
+        abs_node(name, p, [scale(child, sx, sy, sz) for child in c])
+    )
+
+    # 3. EXPAND ROTATION OVER ABSTRACTIONS
+    yield rewrite(rotate(abs_node(name, p, c), x1, y1, z1, w)).to(
+        abs_node(name, p, [rotate(child, x1, y1, z1, w) for child in c])
+    )
+
+    # 4. EXPAND ROTATE(SCALE) PAIR OVER ABSTRACTIONS
+    yield rewrite(rotate(abs_node(String("Scale"), p, c), x1, y1, z1, w)).to(
+        abs_node(String("Rotate(Scale)"), p, [rotate(child, x1, y1, z1, w) for child in c])
+    )
+
+    # 5. EXPAND UNION(TRANSLATE) PAIR OVER ABSTRACTIONS
+    yield rewrite(translate(abs_node(name, p, c), x1, y1, z1) + s2).to(
+        translate(abs_node(name, p, c) + s2, x1, y1, z1)
+    )
+
+    # 6. EXPAND UNION(SYMREF) PAIR OVER ABSTRACTIONS
+    yield rewrite(sym_ref(abs_node(name, p, c), x1, y1, z1, x2, y2, z2)).to(
+        abs_node(name, p, c) + translate(abs_node(name, p, c), x1, y1, z1)
+    )
+
+
 def integrate_abstractions(
     node,
     singleton_models,
@@ -1748,12 +1826,16 @@ def integrate_abstractions(
 ):
     from abstractionssymh.abstraction_compare_utils import get_point_cloud_from_dsl, calculate_chamfer_distance
     from abstractionssymh.dsl_nodes import Box, Scale, Rotate, Translate, Union, SymRef, SymRot, SymTrans
-    from abstractionssymh.abstraction_utils import Abstraction, t, Shape, to_egglog, from_egglog_string, sem_rules
+    from abstractionssymh.abstraction_utils import Abstraction, t, Shape, to_egglog, from_egglog_string, sem_rules, is_well_explained
     import torch
     from egglog import EGraph, Vec
 
     indent = "  " * depth
+    node_label = f"Abs({node.pattern_name})" if isinstance(node, Abstraction) else type(node).__name__
     
+    if detailed_debug:
+        print(f"{indent}[{depth}] >>> Processing Node: {node_label}")
+
     # ------------------------------------------------------------------
     # 1. RECURSIVE STEP (Bottom-Up Traversal)
     # ------------------------------------------------------------------
@@ -1786,33 +1868,28 @@ def integrate_abstractions(
                 current_node = type(node)(rebuilt_children[0], **kwargs)
             else:
                 current_node = type(node)(*rebuilt_children)
-        except Exception:
+        except Exception as e:
+            if detailed_debug: print(f"{indent}[ERROR] Rebuild failed: {e}")
             return node
 
     # ------------------------------------------------------------------
     # 2. SYMBOLIC REFACTORING (Egglog Layer)
     # ------------------------------------------------------------------
-    # try:
-    print(f"{indent}[EGGLOG] Attempting refactor on subtree...")
-
-    egraph = EGraph()
-    egg_shape = egraph.let("subtree", to_egglog(current_node))
-    egraph.run(sem_rules.saturate())
-    extracted, cost = egraph.extract(egg_shape, include_cost=True)
-    print("extracted", extracted)
-    refined = from_egglog_string(extracted, singleton_models, pair_models)
-    print("refined", refined)
-
-    print(refined)
-    
-    if refined is not None and str(refined) != str(current_node):
-        if detailed_debug: print(f"{indent}[EGGLOG] Improved subtree cost (Extracted Cost: {cost})")
-        current_node = refined
-    # except Exception as e:
-    #     if detailed_debug: print(f"{indent}[WARN] Egglog refactor skipped: {e}")
+    try:
+        egraph = EGraph()
+        egg_shape = egraph.let("subtree", to_egglog(current_node))
+        egraph.run(sem_rules.saturate())
+        extracted, cost = egraph.extract(egg_shape, include_cost=True)
+        refined = from_egglog_string(extracted, singleton_models, pair_models)
+        
+        if refined is not None and str(refined) != str(current_node):
+            if detailed_debug: print(f"{indent}[EGGLOG] SUCCESS: Cost {cost} | Refactored: {type(refined).__name__}")
+            current_node = refined
+    except Exception as e:
+        if detailed_debug: print(f"{indent}[EGGLOG] Skipping refactor: {e}")
 
     # ------------------------------------------------------------------
-    # 3. VAE COMPRESSION LAYER (With Detailed Debug)
+    # 3. COMPRESSION LAYER (Standardized for AE, VAE, PCA)
     # ------------------------------------------------------------------
     
     def check_geometric_fidelity(original_node, candidate_abstraction, label):
@@ -1821,11 +1898,9 @@ def integrate_abstractions(
             pc_cand = get_point_cloud_from_dsl(candidate_abstraction, points_per_box=points_per_check)
             if len(pc_orig) == 0 or len(pc_cand) == 0: return False
             dist = calculate_chamfer_distance(pc_orig, pc_cand)
-            
             if detailed_debug:
                 status = "PASS" if dist <= geometric_threshold else "FAIL"
-                print(f"{indent}  [GEO-CHECK] {label} | Chamfer: {dist:.6f} (Limit: {geometric_threshold}) -> {status}")
-            
+                print(f"{indent}  [GEO-CHECK] {label} | Chamfer: {dist:.6f} -> {status}")
             return dist <= geometric_threshold
         except Exception as e:
             if detailed_debug: print(f"{indent}  [GEO-ERROR] {e}")
@@ -1838,7 +1913,7 @@ def integrate_abstractions(
         _, (_, raw_children) = current_node.serialize()
         child_nodes = [c for c in raw_children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
 
-    # --- VAE PAIR LOGIC ---
+    # --- PAIR LOGIC ---
     if len(child_nodes) == 1:
         child = child_nodes[0]
         if isinstance(child, Abstraction):
@@ -1854,45 +1929,45 @@ def integrate_abstractions(
             p_params, _ = current_node.serialize()[1]
             combined = t(torch.tensor(list(p_params or []) + list(child_params or []), dtype=torch.float32)).unsqueeze(0)
             
-            if hasattr(model, 'input_dim') and combined.shape[1] == model.input_dim:
-                normalized = (combined - model.data_mean_) / model.data_std_
-                output = model(normalized)
-                recon, encoding = (output[1], output[0]) if not isinstance(output, tuple) or len(output) != 2 else (output[0], output[1])
+            is_well, error_tensor = is_well_explained(model, combined, error_threshold, detailed_debug)
+            
+            if is_well.any():
+                model.eval()
+                with torch.no_grad():
+                    norm_in = (combined - model.data_mean_.to(combined.device)) / model.data_std_.to(combined.device)
+                    out = model(norm_in)
+                    encoding = out[1] if (isinstance(out, tuple) and out[1].shape != norm_in.shape) else out[0]
                 
-                err = torch.max(torch.abs(recon - normalized)).item()
-                if detailed_debug:
-                    print(f"{indent}[VAE-TRY] PAIR {pair_sig} | Param Error: {err:.6f} (Limit: {error_threshold})")
-                
-                if err < error_threshold:
-                    candidate = Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
-                    if check_geometric_fidelity(current_node, candidate, pair_sig):
-                        if detailed_debug: print(f"{indent}[VAE-SUCCESS] Abstracted PAIR: {pair_sig}")
-                        return candidate
+                candidate = Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
+                if check_geometric_fidelity(current_node, candidate, pair_sig):
+                    # EXPLICIT INTEGRATED LOG
+                    print(f"{indent}*** [INTEGRATED] Pattern: {pair_sig} (Error: {error_tensor.max().item():.6f}) ***")
+                    return candidate
 
-    # --- VAE SINGLETON LOGIC ---
+    # --- SINGLETON LOGIC ---
     name = type(current_node).__name__
     if name in singleton_models:
         model = singleton_models[name]
         params, _ = current_node.serialize()[1]
         if params:
             params_tensor = t(torch.tensor(params, dtype=torch.float32)).unsqueeze(0)
-            if hasattr(model, 'input_dim') and params_tensor.shape[1] == model.input_dim:
-                normalized = (params_tensor - model.data_mean_) / model.data_std_
-                output = model(normalized)
-                recon, encoding = (output[1], output[0]) if not isinstance(output, tuple) or len(output) != 2 else (output[0], output[1])
+            
+            is_well, error_tensor = is_well_explained(model, params_tensor, error_threshold, detailed_debug)
+            
+            if is_well.any():
+                model.eval()
+                with torch.no_grad():
+                    norm_in = (params_tensor - model.data_mean_.to(params_tensor.device)) / model.data_std_.to(params_tensor.device)
+                    out = model(norm_in)
+                    encoding = out[1] if (isinstance(out, tuple) and out[1].shape != norm_in.shape) else out[0]
 
-                err = torch.max(torch.abs(recon - normalized)).item()
-                if detailed_debug:
-                    print(f"{indent}[VAE-TRY] SINGLETON {name} | Param Error: {err:.6f} (Limit: {error_threshold})")
-
-                if err < error_threshold:
-                    candidate = Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
-                    if check_geometric_fidelity(current_node, candidate, name):
-                        if detailed_debug: print(f"{indent}[VAE-SUCCESS] Abstracted SINGLETON: {name}")
-                        return candidate
+                candidate = Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
+                if check_geometric_fidelity(current_node, candidate, name):
+                    # EXPLICIT INTEGRATED LOG
+                    print(f"{indent}*** [INTEGRATED] Singleton: {name} (Error: {error_tensor.max().item():.6f}) ***")
+                    return candidate
 
     return current_node
-
 # def integrate_abstractions(
 #     node,
 #     singleton_models,
