@@ -25,6 +25,7 @@ Key components:
 -   `instantiate_pattern`: A factory function to rebuild concrete DSL
     nodes from their name and (reconstructed) parameters.
 """
+from __future__ import annotations
 
 import re
 import torch
@@ -1621,6 +1622,166 @@ def debug_abstraction(msg):
 def debug_abstraction(msg):
     debug_success(f"[ABSTRACT] {msg}")
 
+# ==============================================================================
+# --- EGGLOG CONFIGURATION ---
+# ==============================================================================
+
+import re
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim import AdamW
+import textwrap
+import matplotlib.pyplot as plt
+from pathlib import Path
+from tqdm.auto import tqdm
+
+# Added for Egglog Integration
+from egglog import (
+    Expr, f64Like, StringLike, Vec, f64, String, 
+    rewrite, ruleset, method, function, EGraph
+)
+
+from abstractionssymh.dsl_nodes import (
+    Box, Scale, Rotate, Translate, Union, SymRef, SymRot, SymTrans,
+)
+from abstractionssymh.debug_utils import debug_info, debug_error, debug_success
+
+class Shape(Expr):
+    @method(cost=10) 
+    def __add__(self, other: Shape) -> Shape: ...
+
+@function(cost=1)
+def box(label: f64Like) -> Shape: ...
+
+@function(cost=0) 
+def abs_node(name: StringLike, params: Vec[f64], children: Vec[Shape]) -> Shape: ...
+
+@function(cost=1)
+def translate(s: Shape, x: f64Like, y: f64Like, z: f64Like) -> Shape: ...
+@function(cost=1)
+def rotate(s: Shape, x: f64Like, y: f64Like, z: f64Like, w: f64Like) -> Shape: ...
+@function(cost=1)
+def scale(s: Shape, sx: f64Like, sy: f64Like, sz: f64Like) -> Shape: ...
+@function(cost=1)
+def sym_ref(s: Shape, nx: f64Like, ny: f64Like, nz: f64Like, px: f64Like, py: f64Like, pz: f64Like) -> Shape: ...
+@function(cost=1)
+def sym_rot(s: Shape, ax: f64Like, ay: f64Like, az: f64Like, cx: f64Like, cy: f64Like, cz: f64Like, n: f64Like) -> Shape: ...
+@function(cost=1)
+def sym_trans(s: Shape, dx: f64Like, dy: f64Like, dz: f64Like, n: f64Like) -> Shape: ...
+
+# --- Conversion Helpers ---
+
+def to_egglog(node) -> Shape:
+    """Lifts Python DSL/Abstraction objects into Egglog Shape."""
+    from abstractionssymh.dsl_nodes import Box, Scale, Rotate, Translate, Union, SymRef, SymRot, SymTrans
+    from abstractionssymh.abstraction_utils import Abstraction
+    
+    if isinstance(node, Abstraction):
+        # FIX: Use capital Vec constructor
+        p_vec = Vec(*[f64(float(p)) for p in node.compressed_params])
+        c_vec = Vec(*[to_egglog(c) for c in node.children])
+        return abs_node(node.pattern_name, p_vec, c_vec)
+    
+    elif isinstance(node, Box):
+        return box(f64(float(node.label)))
+    
+    elif isinstance(node, Scale):
+        sx, sy, sz = map(lambda v: f64(float(v)), node.lengths)
+        return scale(to_egglog(node.child), sx, sy, sz)
+    
+    elif isinstance(node, Rotate):
+        x, y, z, w = map(lambda v: f64(float(v)), node.quaternion)
+        return rotate(to_egglog(node.child), x, y, z, w)
+    
+    elif isinstance(node, Translate):
+        x, y, z = map(lambda v: f64(float(v)), node.center)
+        return translate(to_egglog(node.child), x, y, z)
+    
+    elif isinstance(node, Union):
+        return to_egglog(node.left) + to_egglog(node.right)
+    
+    elif isinstance(node, SymRef):
+        nx, ny, nz = map(lambda v: f64(float(v)), node.plane)
+        px, py, pz = map(lambda v: f64(float(v)), node.point_on_plane)
+        return sym_ref(to_egglog(node.child), nx, ny, nz, px, py, pz)
+    
+    elif isinstance(node, SymRot):
+        ax, ay, az = map(lambda v: f64(float(v)), node.axis)
+        cx, cy, cz = map(lambda v: f64(float(v)), node.center)
+        return sym_rot(to_egglog(node.child), ax, ay, az, cx, cy, cz, f64(float(node.n)))
+    
+    elif isinstance(node, SymTrans):
+        dx, dy, dz = map(lambda v: f64(float(v)), node.end_point)
+        return sym_trans(to_egglog(node.child), dx, dy, dz, f64(float(node.n)))
+    
+    return box(f64(-1.0))
+
+def from_egglog_string(egg_expr, singleton_models, pair_models):
+    """Lowers Egglog string back to Python DSL/Abstraction objects."""
+    from abstractionssymh.dsl_nodes import Box, Scale, Rotate, Translate, Union, SymRef, SymRot, SymTrans
+    from abstractionssymh.abstraction_utils import Abstraction
+    import re
+
+    def dsl_add(self, other): return Union(self, other)
+    for cls in [Box, Scale, Rotate, Translate, Union, SymRef, SymRot, SymTrans, Abstraction]:
+        cls.__add__ = dsl_add
+
+    namespace = {
+        "box": lambda l: Box(label=int(l)),
+        "scale": lambda c, x, y, z: Scale(c, [x, y, z]),
+        "rotate": lambda c, x, y, z, w: Rotate(c, [x, y, z, w]),
+        "translate": lambda c, x, y, z: Translate(c, [x, y, z]),
+        "sym_ref": lambda c, nx, ny, nz, px, py, pz: SymRef(c, [nx, ny, nz], [px, py, pz]),
+        "sym_rot": lambda c, ax, ay, az, cx, cy, cz, n: SymRot(c, [ax, ay, az], [cx, cy, cz], int(n)),
+        "sym_trans": lambda c, dx, dy, dz, n: SymTrans(c, [dx, dy, dz], int(n)),
+        "add": lambda a, b: Union(a, b),
+        # Handles the conversion of Egglog Vecs back to Python lists
+        "vec": lambda *args: list(args),
+        "abs_node": lambda name, params, children: Abstraction(
+            pattern_name=name, compressed_params=params,
+            model=pair_models.get(name) or singleton_models.get(name),
+            children=children
+        )
+    }
+    try:
+        expr_str = str(egg_expr).strip()
+        assignments = re.findall(r"^(_\w+)\s*=\s*(.*)$", expr_str, re.MULTILINE)
+        # Filters out intermediate assignments for the final eval body
+        body_lines = [l for l in expr_str.splitlines() if not re.match(r"^_\w+\s*=", l.strip()) and l.strip()]
+        
+        for var_name, var_val in assignments:
+            namespace[var_name] = eval(var_val.strip(), {"__builtins__": {}}, namespace)
+            
+        return eval("\n".join(body_lines).strip(), {"__builtins__": {}}, namespace)
+    except Exception: return None
+
+# --- Ruleset ---
+
+sem_rules = ruleset()
+
+@sem_rules.register
+def _rules_def(
+    s: Shape, s2: Shape, s3: Shape, name: String, p: Vec[f64], c: Vec[Shape],
+    x1: f64, y1: f64, z1: f64, x2: f64, y2: f64, z2: f64, sx: f64, sy: f64, sz: f64, w: f64
+):
+    # Abstraction mirrored symmetry
+    yield rewrite(translate(abs_node(name, p, c), x1, y1, z1) + translate(abs_node(name, p, c), f64(-1.0) * x1, y1, z1)).to(
+        sym_ref(translate(abs_node(name, p, c), x1, y1, z1), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    )
+    # L0 mirrored symmetry
+    yield rewrite(translate(s, x1, y1, z1) + translate(s, f64(-1.0) * x1, y1, z1)).to(
+        sym_ref(translate(s, x1, y1, z1), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    )
+    # Factor common translations
+    yield rewrite(translate(s, x1, y1, z1) + translate(s2, x1, y1, z1)).to(translate(s + s2, x1, y1, z1))
+    # Combine nested translations
+    yield rewrite(translate(translate(s, x1, y1, z1), x2, y2, z2)).to(translate(s, x1 + x2, y1 + y2, z1 + z2))
+    # Remove no-ops
+    yield rewrite(translate(s, 0.0, 0.0, 0.0)).to(s)
+    yield rewrite(scale(s, 1.0, 1.0, 1.0)).to(s)
+    yield rewrite(rotate(s, 0.0, 0.0, 0.0, 1.0)).to(s)
+
 def integrate_abstractions(
     node,
     singleton_models,
@@ -1632,36 +1793,76 @@ def integrate_abstractions(
     detailed_debug=False
 ):
     from abstractionssymh.abstraction_compare_utils import get_point_cloud_from_dsl, calculate_chamfer_distance
-    
+    from abstractionssymh.dsl_nodes import Box, Scale, Rotate, Translate, Union, SymRef, SymRot, SymTrans
+    from abstractionssymh.abstraction_utils import Abstraction, t, Shape, to_egglog, from_egglog_string, sem_rules
+    import torch
+    from egglog import EGraph, Vec
+
     indent = "  " * depth
     
-    # [Recursion and serialization logic remains identical to original]
+    # ------------------------------------------------------------------
+    # 1. RECURSIVE STEP (Bottom-Up Traversal)
+    # ------------------------------------------------------------------
     if isinstance(node, Abstraction):
-        node.children = [integrate_abstractions(c, singleton_models, pair_models, error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug) for c in node.children]
+        node.children = [integrate_abstractions(c, singleton_models, pair_models, 
+                                               error_threshold, geometric_threshold, 
+                                               points_per_check, depth+1, detailed_debug) 
+                         for c in node.children]
+        current_node = node
+    elif not hasattr(node, "serialize"):
         return node
-    if not hasattr(node, "serialize"): return node
+    else:
+        try:
+            _, (_, children) = node.serialize()
+            rebuilt_children = []
+            for c in children:
+                if hasattr(c, "serialize") or isinstance(c, Abstraction):
+                    rebuilt_children.append(integrate_abstractions(c, singleton_models, pair_models, 
+                                                                   error_threshold, geometric_threshold, 
+                                                                   points_per_check, depth+1, detailed_debug))
+                else:
+                    rebuilt_children.append(c)
+            
+            # Rebuild node with optimized children
+            if isinstance(node, Union): current_node = Union(rebuilt_children[0], rebuilt_children[1])
+            elif isinstance(node, SymRef): current_node = SymRef(rebuilt_children[0], plane_normal=node.plane, point_on_plane=node.point_on_plane)
+            elif isinstance(node, SymRot): current_node = SymRot(rebuilt_children[0], axis=node.axis, center=node.center, n_fold=node.n)
+            elif isinstance(node, SymTrans): current_node = SymTrans(rebuilt_children[0], end_point=node.end_point, n_fold=node.n)
+            elif hasattr(node, "child"):
+                kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
+                current_node = type(node)(rebuilt_children[0], **kwargs)
+            else:
+                current_node = type(node)(*rebuilt_children)
+        except Exception:
+            return node
 
-    try: _, (_, children) = node.serialize()
-    except Exception: return node
-
-    rebuilt_children = []
-    for c in children:
-        if hasattr(c, "serialize") or isinstance(c, Abstraction):
-            rebuilt_children.append(integrate_abstractions(c, singleton_models, pair_models, error_threshold, geometric_threshold, points_per_check, depth+1, detailed_debug))
-        else: rebuilt_children.append(c)
-
-    # Rebuild Node logic [Same as original]
+    # ------------------------------------------------------------------
+    # 2. SYMBOLIC REFACTORING (Egglog Layer)
+    # ------------------------------------------------------------------
     try:
-        if isinstance(node, Union): current_node = Union(rebuilt_children[0], rebuilt_children[1])
-        elif isinstance(node, SymRef): current_node = SymRef(rebuilt_children[0], plane_normal=node.plane, point_on_plane=node.point_on_plane)
-        elif isinstance(node, SymRot): current_node = SymRot(rebuilt_children[0], axis=node.axis, center=node.center, n_fold=node.n)
-        elif isinstance(node, SymTrans): current_node = SymTrans(rebuilt_children[0], end_point=node.end_point, n_fold=node.n)
-        elif hasattr(node, "child"):
-            kwargs = {k: v for k, v in node.__dict__.items() if k != "child"}
-            current_node = type(node)(rebuilt_children[0], **kwargs)
-        else: current_node = type(node)(*rebuilt_children)
-    except Exception: return node
+        egraph = EGraph()
+        # Ensure to_egglog and from_egglog_string are imported/defined in the file scope
+        egg_shape = egraph.let("subtree", to_egglog(current_node))
+        
+        # Run rules to find symmetries and factor out transforms
+        egraph.run(sem_rules.saturate())
+        
+        # Extract the lowest cost representation
+        extracted, cost = egraph.extract(egg_shape, include_cost=True)
+        
+        # Convert back to Python DSL
+        refined = from_egglog_string(extracted, singleton_models, pair_models)
+        
+        if refined is not None and str(refined) != str(current_node):
+            if detailed_debug: print(f"{indent}[EGGLOG] Improved subtree cost (Extracted Cost: {cost})")
+            current_node = refined
+    except Exception as e:
+        if detailed_debug: print(f"{indent}[WARN] Egglog refactor skipped: {e}")
 
+    # ------------------------------------------------------------------
+    # 3. VAE COMPRESSION LAYER
+    # ------------------------------------------------------------------
+    
     def check_geometric_fidelity(original_node, candidate_abstraction):
         try:
             pc_orig = get_point_cloud_from_dsl(original_node, points_per_box=points_per_check)
@@ -1671,81 +1872,61 @@ def integrate_abstractions(
             return dist <= geometric_threshold
         except Exception: return False
 
-    # --- PAIR ABSTRACTION ---
-    child_nodes = [c for c in rebuilt_children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
+    # Get candidate child nodes for VAE pattern matching
+    child_nodes = []
+    if isinstance(current_node, Abstraction):
+        child_nodes = current_node.children
+    elif hasattr(current_node, "serialize"):
+        _, (_, raw_children) = current_node.serialize()
+        child_nodes = [c for c in raw_children if hasattr(c, "serialize") or isinstance(c, Abstraction)]
+
+    # --- VAE PAIR LOGIC ---
     if len(child_nodes) == 1:
         child = child_nodes[0]
         if isinstance(child, Abstraction):
-            child_name = f"Abs({child.pattern_name})"
-            child_params = child.compressed_params
-            grandchildren = child.children
+            child_name, child_params, grandchildren = f"Abs({child.pattern_name})", child.compressed_params, child.children
         else:
             child_name = type(child).__name__
             child_params, gc_raw = child.serialize()[1]
             grandchildren = [gc for gc in gc_raw if hasattr(gc, "serialize") or isinstance(gc, Abstraction)]
 
         pair_sig = f"{type(current_node).__name__}({child_name})"
-
         if pair_sig in pair_models:
             model = pair_models[pair_sig]
             p_params, _ = current_node.serialize()[1]
-            
             combined = t(torch.tensor(list(p_params or []) + list(child_params or []), dtype=torch.float32)).unsqueeze(0)
             
-            # --- FIX: Explicit dimension check to prevent runtime errors ---
             if hasattr(model, 'input_dim') and combined.shape[1] == model.input_dim:
                 normalized = (combined - model.data_mean_) / model.data_std_
-                
-                # --- FIX: Handle VAE tuple output safely ---
                 output = model(normalized)
-                if isinstance(output, tuple):
-                     # VAE Inference returns (recon, mu)
-                    recon = output[0]
-                    encoding = output[1]
-                else:
-                    # AE returns (latent, recon)
-                    encoding = output[0]
-                    recon = output[1]
-
-                param_error = torch.max(torch.abs(recon - normalized)).item()
-
-                if param_error < error_threshold:
+                # Handle AE (latent, recon) vs VAE (recon, mu)
+                recon, encoding = (output[1], output[0]) if not isinstance(output, tuple) or len(output) != 2 else (output[0], output[1])
+                
+                if torch.max(torch.abs(recon - normalized)).item() < error_threshold:
                     candidate = Abstraction(pair_sig, encoding.squeeze().tolist(), model, children=grandchildren)
                     if check_geometric_fidelity(current_node, candidate):
-                        if detailed_debug: debug_abstraction(f"Applied PAIR: {pair_sig}")
+                        if detailed_debug: print(f"{indent}[VAE] Abstracted PAIR: {pair_sig}")
                         return candidate
 
-    # --- SINGLETON ABSTRACTION ---
+    # --- VAE SINGLETON LOGIC ---
     name = type(current_node).__name__
     if name in singleton_models:
         model = singleton_models[name]
         params, _ = current_node.serialize()[1]
         if params:
             params_tensor = t(torch.tensor(params, dtype=torch.float32)).unsqueeze(0)
-            
-            # --- FIX: Explicit dimension check ---
             if hasattr(model, 'input_dim') and params_tensor.shape[1] == model.input_dim:
                 normalized = (params_tensor - model.data_mean_) / model.data_std_
-                
-                # --- FIX: Handle VAE tuple output safely ---
                 output = model(normalized)
-                if isinstance(output, tuple):
-                    recon = output[0]
-                    encoding = output[1]
-                else:
-                    encoding = output[0]
-                    recon = output[1]
+                recon, encoding = (output[1], output[0]) if not isinstance(output, tuple) or len(output) != 2 else (output[0], output[1])
 
-                param_error = torch.max(torch.abs(recon - normalized)).item()
-
-                if param_error < error_threshold:
+                if torch.max(torch.abs(recon - normalized)).item() < error_threshold:
                     candidate = Abstraction(name, encoding.squeeze().tolist(), model, children=child_nodes)
                     if check_geometric_fidelity(current_node, candidate):
-                        if detailed_debug: debug_abstraction(f"Applied SINGLETON: {name}")
+                        if detailed_debug: print(f"{indent}[VAE] Abstracted SINGLETON: {name}")
                         return candidate
 
     return current_node
-
 # def integrate_abstractions(
 #     node,
 #     singleton_models,
