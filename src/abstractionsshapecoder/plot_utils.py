@@ -19,7 +19,6 @@ from pathlib import Path
 import k3d
 import numpy as np
 from scipy.spatial.transform import Rotation
-from debug_utils import debug_info, debug_error, debug_success
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -34,6 +33,49 @@ LABEL_COLORS = {
 }
 """dict: Color map for part labels, mapping integer IDs to hex color codes."""
 
+DEBUG = True
+"""bool: Global switch to enable/disable debug prints. (Default: True)"""
+
+from termcolor import cprint
+
+
+def debug_info(*args):
+    """Print a yellow [INFO] message if debugging is enabled.
+
+    Parameters
+    ----------
+    *args
+        Variable length argument list, passed to `print()`.
+        All arguments are converted to strings and joined with spaces.
+    """
+    if DEBUG:
+        cprint(f"[INFO] {' '.join(map(str, args))}", "yellow")
+
+
+def debug_error(*args):
+    """Print a red [ERROR] message if debugging is enabled.
+
+    Parameters
+    ----------
+    *args
+        Variable length argument list, passed to `print()`.
+        All arguments are converted to strings and joined with spaces.
+    """
+    if DEBUG:
+        cprint(f"[ERROR] {' '.join(map(str, args))}", "red")
+
+
+def debug_success(*args):
+    """Print a green [SUCCESS] message if debugging is enabled.
+
+    Parameters
+    ----------
+    *args
+        Variable length argument list, passed to `print()`.
+        All arguments are converted to strings and joined with spaces.
+    """
+    if DEBUG:
+        cprint(f"[SUCCESS] {' '.join(map(str, args))}", "green")
 
 # --- Functions ---
 
