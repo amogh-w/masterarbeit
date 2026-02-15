@@ -496,3 +496,157 @@ def plot_dsl_grid(
         debug_success("Grid plot displayed successfully.")
 
     plt.close(fig)
+
+def plot_dsl_grid_specular(
+    dsl_objects,
+    names,
+    save_path=None,
+    grid_cols=3,
+    figsize_per_plot=(5, 5),
+    axis_limits=(-0.7, 0.7),
+    grid_title="",
+    euler_angles=[90, 0, 20], 
+    camera_view=[25, -45],
+    sun_direction=[1.0, 1.0, 1.0]  # Changed default to a balanced direction
+):
+    import math
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    from scipy.spatial.transform import Rotation
+
+    # 1. Setup Sun Vector - ALWAYS NORMALIZE
+    sun_dir = np.array(sun_direction, dtype=float)
+    sun_dir = sun_dir / np.linalg.norm(sun_dir)
+    
+    # 2. Camera Vector for Specular - FIXED CALCULATION
+    # Matplotlib's view_init uses: elev (vertical angle), azim (horizontal angle)
+    elev = np.deg2rad(camera_view[0])  # elevation from horizontal plane
+    azim = np.deg2rad(camera_view[1])   # azimuth from north (Y-axis in matplotlib)
+    
+    # Standard spherical to cartesian for camera direction
+    # In matplotlib 3D: X points right, Y points back, Z points up
+    cam_dir = np.array([
+        np.cos(elev) * np.sin(azim),  # X component
+        np.cos(elev) * np.cos(azim),  # Y component 
+        np.sin(elev)                   # Z component
+    ])
+    cam_dir = cam_dir / np.linalg.norm(cam_dir)
+
+    num_plots = len(dsl_objects)
+    num_rows = math.ceil(num_plots / grid_cols)
+    
+    fig, axes = plt.subplots(
+        num_rows, grid_cols,
+        figsize=(grid_cols * figsize_per_plot[0], num_rows * figsize_per_plot[1]),
+        subplot_kw={"projection": "3d"},
+        squeeze=False,
+    )
+
+    manual_rotation = Rotation.from_euler('xyz', euler_angles, degrees=True)
+    axes_flat = axes.flatten()
+
+    for i, dsl_root_node in enumerate(dsl_objects):
+        ax = axes_flat[i]
+        ax.set_axis_off()
+        ax.set_facecolor('white')
+        ax.view_init(elev=camera_view[0], azim=camera_view[1])
+
+        final_boxes = expand_dsl_tree(dsl_root_node)
+        if not final_boxes: 
+            continue
+
+        for box in final_boxes:
+            # Geometry setup
+            center = manual_rotation.apply(np.array(box.get("center", [0, 0, 0]), dtype=float))
+            lengths = np.asarray(box.get("lengths", [1, 1, 1]), dtype=float).ravel()
+            new_quat = (manual_rotation * Rotation.from_quat(box["quaternion"])).as_quat()
+            rot_mat = Rotation.from_quat(new_quat).as_matrix()
+            
+            d1, d2, d3 = [col * length / 2 for col, length in zip(rot_mat.T, lengths)]
+            corners = np.array([
+                center - d1 - d2 - d3, center + d1 - d2 - d3,
+                center + d1 + d2 - d3, center - d1 + d2 - d3,
+                center - d1 - d2 + d3, center - d1 + d2 + d3,
+                center + d1 - d2 + d3, center + d1 + d2 + d3,
+            ])
+
+            faces_idx = [[0, 1, 2, 3], [4, 5, 7, 6], [0, 1, 6, 4], [2, 3, 5, 7], [0, 3, 5, 4], [1, 2, 7, 6]]
+            base_rgb = hex_to_rgb_normalized(LABEL_COLORS.get(box.get("label_id", -1), LABEL_COLORS[-1]))
+
+            for f_idx in faces_idx:
+                face_verts = corners[f_idx]
+                
+                # Calculate face normal (ensure correct orientation)
+                v1 = face_verts[1] - face_verts[0]
+                v2 = face_verts[2] - face_verts[0]
+                normal = np.cross(v1, v2)
+                norm = np.linalg.norm(normal)
+                if norm == 0: 
+                    continue
+                normal /= norm
+                
+                # Ensure normal points outward (check by dot with vector from center)
+                face_center = np.mean(face_verts, axis=0)
+                if np.dot(normal, face_center - center) < 0:
+                    normal = -normal
+
+                # --- IMPROVED SHADING ---
+                
+                # A. Ambient (base illumination)
+                ambient = 0.3
+                
+                # B. Diffuse (Lambertian) - light from sun direction
+                diffuse_intensity = np.dot(normal, sun_dir)
+                diffuse = max(0, diffuse_intensity)  # Clamp negative values to 0
+                
+                # C. Specular (Blinn-Phong) - fixed calculation
+                view_dir = cam_dir
+                halfway = (sun_dir + view_dir)
+                halfway_norm = np.linalg.norm(halfway)
+                if halfway_norm > 0:
+                    halfway = halfway / halfway_norm
+                    specular_intensity = np.dot(normal, halfway)
+                    specular_intensity = max(0, specular_intensity) ** 32  # Higher shininess
+                else:
+                    specular_intensity = 0
+                
+                # D. Final Color (combine components)
+                # Base color * (ambient + diffuse) + white specular
+                diffuse_factor = ambient + 0.7 * diffuse
+                final_rgb = [
+                    np.clip(c * diffuse_factor + 0.3 * specular_intensity, 0, 1) 
+                    for c in base_rgb
+                ]
+
+                poly = Poly3DCollection([face_verts], facecolors=[final_rgb], 
+                                        edgecolors="#1a1a1a", linewidths=0.3)
+                ax.add_collection3d(poly)
+
+        ax.set_xlim(axis_limits)
+        ax.set_ylim(axis_limits)
+        ax.set_zlim(axis_limits)
+        ax.set_box_aspect([1, 1, 1])
+        
+        # --- MINIMAL NAME OVERLAY ---
+        # Positioned top-right, using a clean serif font to match thesis text
+        ax.text2D(0.95, 0.95, names[i], 
+                  transform=ax.transAxes, 
+                  fontsize=10, 
+                  fontweight='bold',
+                  family='serif', 
+                  va='top', ha='right',
+                  color='#2c3e50', # Deep professional blue-gray
+                  bbox=dict(
+                      boxstyle='round,pad=0.3', 
+                      facecolor='white', 
+                      edgecolor='#bdc3c7', 
+                      alpha=0.7,      # Semi-transparent to feel 'integrated'
+                      linewidth=0.5
+                  ))
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    else:
+        plt.show()
