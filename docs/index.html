@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="description" content="[Your Thesis Description]">
+  <meta name="keywords" content="[Keywords, Separated, By, Commas]">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Abstraction Discovery in Shape Programs</title>
+
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro" rel="stylesheet">
+
+  <link rel="stylesheet" href="./static/css/bulma.min.css">
+  <link rel="stylesheet" href="./static/css/bulma-carousel.min.css">
+  <link rel="stylesheet" href="./static/css/bulma-slider.min.css">
+  <link rel="stylesheet" href="./static/css/fontawesome.all.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  <link rel="stylesheet" href="./static/css/index.css">
+  <link rel="icon" href="./static/images/favicon.svg">
+
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script defer src="./static/js/fontawesome.all.min.js"></script>
+  <script src="./static/js/bulma-carousel.min.js"></script>
+  <script src="./static/js/bulma-slider.min.js"></script>
+  <script src="./static/js/index.js"></script>
+</head>
+<body>
+
+<section class="hero">
+  <div class="hero-body">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h1 class="title is-1 publication-title">Abstraction Discovery in Shape Programs</h1>
+          <div class="is-size-5 publication-authors">
+            <span class="author-block">Amogh Warkhandkar</span>
+          </div>
+
+          <div class="is-size-5 publication-authors">
+            <span class="author-block">Visual Computing Institute @ RWTH Aachen University</span>
+          </div>
+
+          <div class="column has-text-centered">
+            <div class="publication-links">
+              <!-- PDF Link -->
+              <span class="link-block">
+                <a href="https://github.com/amogh-w/RWTH-Projects/raw/main/Masterarbeit/thesis.pdf" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fas fa-file-pdf"></i></span>
+                  <span>Thesis PDF</span>
+                </a>
+              </span>
+              <!-- Presentation Link -->
+              <span class="link-block">
+                <a href="https://github.com/amogh-w/RWTH-Projects/raw/main/Masterarbeit/thesis_presentation.pptx" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fas fa-file-powerpoint"></i></span>
+                  <span>Presentation</span>
+                </a>
+              </span>
+              <!-- Code Link -->
+              <span class="link-block">
+                <a href="https://github.com/amogh-w/masterarbeit" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fab fa-github"></i></span>
+                  <span>Code</span>
+                </a>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="column has-text-centered">
+      <img src="./static/images/abstraction_example.png" alt="Example of an Abstraction Node">
+    </div>
+
+    <!-- Abstract -->
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Abstract</h2>
+        <div class="content has-text-justified">
+          <p>
+            A central challenge in neurosymbolic graphics is the automated discovery of programmatic abstractions from hierarchical 3D shape representations. While procedural models provide structural clarity, real-world objects often exhibit complex relationships that rigid symbolic templates cannot capture. Traditional approaches rely on a greedy parametric search over a fixed combination of variables, creating a "symbolic bottleneck" where non-linear dependencies remain uncompressed. This thesis introduces a neurosymbolic framework that replaces discrete symbolic matching with the neural modeling of parametric data extracted from a functional DSL. By utilizing parameter clustering and intrinsic dimensionality estimation techniques, the framework identifies the intrinsic degrees of freedom within the data and models them using neural networks like Autoencoders to learn non-linear dependencies between parameters for high-fidelity reconstruction, and Variational Autoencoders for increased latent interpretability and editability. When integrated into an E-graph for structural refactoring, this approach successfully resolves complex parametric variations that symbolic solvers might miss. Evaluated on diverse 3D shape categories, our framework demonstrates the power of combining neural flexibility with symbolic structure to achieve improved program compression as measured by the minimum description length principle.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Motivation -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Motivation</h2>
+        <div class="content has-text-justified">
+          <p>
+            The core challenge in my work is the inefficiency of current greedy search methods for finding abstractions. When the system attempts to fill parameter slots, it considers constants, direct variable mappings, and combinations of variables with arithmetic operators. This manual exploration of every possible combination leads to a <b>combinatorial explosion</b>, where the search space grows too fast for the system to handle effectively. 
+          </p>
+          <p>
+            Instead of relying on these traditional methods to guess relationships through math, my thesis explores a different path. I used autoencoders to learn the underlying relationships between parameters directly from the data. This approach allowed the system to identify meaningful structures automatically, bypassing the limitations of exhaustive search.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<!--/ Motivation -->
+
+<!-- Results -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Results</h2>
+        <div class="content has-text-justified">
+          <p>
+            <b>Comparison of complexity reduction across methods</b>. Each row (a–j) shows an input model from PartNet-Sym and its reconstructions using PCA, AE, and VAE across two hierarchical levels (L1, L2). The values below each model represent structural node counts and total parameter counts. The results demonstrate progressive compression from L1 to L2 and clear performance gains with latent models. Rows (c, f, h) highlight failure cases where aggressive compression causes geometric disconnection of chair components.
+          </p>
+          
+          <div class="column has-text-centered">
+            <img src="https://github.com/amogh-w/masterarbeit/raw/main/thesis/figures/chaircomparegenius.png" alt="Comparison of models showing structure and parameter reduction">
+          </div>
+
+          <p>
+            <b>Latent space navigation</b>. The VAE manifold enables smooth geometric transitions, ensuring stable variations during latent space traversal. Unlike standard Autoencoders, which can produce disjoint artifacts, the VAE preserves geometric stability by learning a continuous and stable latent manifold.
+          </p>
+
+          <div class="column has-text-centered">
+            <img src="https://github.com/amogh-w/masterarbeit/raw/main/thesis/figures/latentwalkscale.png" alt="Latent space visualization and traversal">
+          </div>
+
+          <p>
+            <b>Software</b>. Developed an interactive tool to demonstrate the practical application of these learned abstractions. It allows for the live manipulation of latent codes, enabling users to edit 3D shapes and their corresponding hierarchical abstractions in real time.
+          </p>
+
+          <div class="columns is-vcentered">
+            <div class="column has-text-centered">
+              <img src="./static/images/shapeeditor.png" alt="Interactive shape editor interface">
+              <p><small><strong>Interactive latent code manipulation.</strong></small></p>
+            </div>
+            <div class="column has-text-centered">
+              <img src="./static/images/modify_chair.gif" alt="Changing chair shapes animation">
+              <p><small><strong>Live editing example.</strong></small></p>
+            </div>
+          </div>
+        </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<!--/ Results -->
+
+<!-- <section class="section" id="BibTeX">
+  <div class="container is-max-desktop content">
+    <h2 class="title">BibTeX</h2>
+    <pre><code>[Insert your BibTeX citation here]</code></pre>
+  </div>
+</section> -->
+
+<footer class="footer">
+  <div class="container">
+    <div class="content has-text-centered">
+      <p>
+        This website is licensed under a <a rel="license" href="http://creativecommons.org/licenses/by-sa/4.0/">Creative Commons Attribution-ShareAlike 4.0 International License</a>.
+      </p>
+      <p>
+        This website is based on the <a href="https://nerfies.github.io/">Nerfies</a> project page.
+      </p>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
